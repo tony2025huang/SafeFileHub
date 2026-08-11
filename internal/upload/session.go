@@ -80,25 +80,41 @@ func (m *Manager) Write(ctx context.Context, id string, offset int64, body io.Re
 	lock := m.lock(id)
 	lock.Lock()
 	defer lock.Unlock()
-	s, err := m.Get(ctx, id)
+	// Read just enough to find the staging file. This snapshot is deliberately
+	// not used for validation or writes: another process can commit while this
+	// process waits for the advisory file lock.
+	staging, err := m.repo.UploadSessionByID(ctx, id)
 	if err != nil {
 		return 0, err
 	}
-	if offset != s.Offset {
-		return s.Offset, ErrOffset
-	}
-	f, err := m.store.OpenStagingWrite(s.StagingPath)
+	f, err := m.store.OpenStagingWrite(staging.StagingPath)
 	if err != nil {
-		return s.Offset, err
+		return staging.Offset, err
 	}
 	defer f.Close()
 	// The per-process mutex prevents local races; advisory flock extends the
 	// single-writer invariant to independent processes sharing this staging
 	// volume. The CAS remains authoritative for metadata persistence.
 	if err = unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
-		return s.Offset, fmt.Errorf("lock staging: %w", err)
+		return staging.Offset, fmt.Errorf("lock staging: %w", err)
 	}
 	defer func() { _ = unix.Flock(int(f.Fd()), unix.LOCK_UN) }()
+	// Flock is the cross-process serialization boundary. Refresh all mutable
+	// session fields only after acquiring it, so a writer that waited on the
+	// lock cannot truncate or CAS against a stale offset.
+	s, err := m.repo.UploadSessionByID(ctx, id)
+	if err != nil {
+		return staging.Offset, err
+	}
+	if !s.ExpiresAt.After(time.Now()) {
+		// Preserve Get's expired-session behavior: cleanup is best-effort and
+		// callers observe the session as gone even when cleanup needs a retry.
+		_ = m.cancelLocked(ctx, s)
+		return 0, db.ErrNotFound
+	}
+	if offset != s.Offset {
+		return s.Offset, ErrOffset
+	}
 	// A prior interrupted attempt may have left uncommitted bytes. Normalize
 	// first, then write exactly from the persisted CAS offset.
 	if err = f.Truncate(s.Offset); err != nil {
@@ -138,12 +154,15 @@ func (m *Manager) Cancel(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	return m.cancelLocked(ctx, s)
+}
+func (m *Manager) cancelLocked(ctx context.Context, s db.UploadSession) error {
 	// Delete staging first. On failure leave metadata available for a retry;
 	// deleting metadata first would create an untracked .part file.
-	if err = m.store.RemoveStaging(s.StagingPath); err != nil {
+	if err := m.store.RemoveStaging(s.StagingPath); err != nil {
 		return err
 	}
-	if err = m.repo.DeleteUploadSession(ctx, id); err != nil {
+	if err := m.repo.DeleteUploadSession(ctx, s.ID); err != nil {
 		// ENOENT is treated as successful removal, so a retry converges even if
 		// database deletion failed after the file was removed.
 		return err

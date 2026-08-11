@@ -3,7 +3,9 @@ package upload
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -218,4 +220,74 @@ func (r *failingDeleteRepo) DeleteUploadSession(ctx context.Context, id string) 
 		return io.ErrUnexpectedEOF
 	}
 	return r.Repository.DeleteUploadSession(ctx, id)
+}
+
+func TestWriteDoesNotTruncateCommittedDataAfterCrossManagerStaleRead(t *testing.T) {
+	root := t.TempDir()
+	store, err := storage.NewObjectStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	repo, err := db.Open(context.Background(), root+"/meta.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	u, _ := repo.CreateUser(context.Background(), db.User{Username: "u", PasswordHash: "x"})
+	r, _ := repo.CreateStorageRoot(context.Background(), db.StorageRoot{Name: "r", Path: root})
+	stale := &staleReadRepo{Repository: repo, staleRead: make(chan struct{}), release: make(chan struct{})}
+	first := New(repo, store, 1, time.Hour)
+	second := New(stale, store, 1, time.Hour)
+	s, err := first.Create(context.Background(), u.ID, r.ID, "/a", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := second.Write(context.Background(), s.ID, 0, bytes.NewBufferString("world"))
+		secondDone <- err
+	}()
+	<-stale.staleRead // second manager has materialized offset 0, but has not locked the file.
+	if got, err := first.Write(context.Background(), s.ID, 0, bytes.NewBufferString("hello")); err != nil || got != 5 {
+		t.Fatalf("first Write = %d, %v", got, err)
+	}
+	close(stale.release)
+	if err := <-secondDone; !errors.Is(err, ErrOffset) {
+		t.Fatalf("stale Write error = %v, want ErrOffset", err)
+	}
+
+	persisted, err := repo.UploadSessionByID(context.Background(), s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := store.OpenStaging(persisted.StagingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(f)
+	_ = f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Offset != 5 || int64(len(body)) != persisted.Offset || string(body) != "hello" {
+		t.Fatalf("committed staging corrupted: offset=%d length=%d body=%q", persisted.Offset, len(body), body)
+	}
+}
+
+type staleReadRepo struct {
+	*db.Repository
+	staleRead chan struct{}
+	release   chan struct{}
+	once      sync.Once
+}
+
+func (r *staleReadRepo) UploadSessionByID(ctx context.Context, id string) (db.UploadSession, error) {
+	s, err := r.Repository.UploadSessionByID(ctx, id)
+	r.once.Do(func() {
+		close(r.staleRead)
+		<-r.release
+	})
+	return s, err
 }
