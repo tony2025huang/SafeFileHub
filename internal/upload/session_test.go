@@ -719,6 +719,25 @@ func TestRecoverCapsScanAt64(t *testing.T) {
 	}
 }
 
+func TestRecoverHonorsCancellationBeforeScanning(t *testing.T) {
+	root := t.TempDir()
+	store, err := storage.NewObjectStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	repo, err := db.Open(context.Background(), root+"/meta.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := New(repo, store, 1, time.Hour).Recover(ctx, 64, false); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Recover error = %v, want context cancellation", err)
+	}
+}
+
 func TestRecoverReportsStorageErrors(t *testing.T) {
 	root := t.TempDir()
 	store, err := storage.NewObjectStore(root)

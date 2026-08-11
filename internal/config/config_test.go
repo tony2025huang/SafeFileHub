@@ -38,6 +38,12 @@ func TestDefaultConfiguration(t *testing.T) {
 	if got, want := cfg.UploadSessionTTL, 24*time.Hour; got != want {
 		t.Fatalf("UploadSessionTTL = %s, want %s", got, want)
 	}
+	if got, want := cfg.UploadRecoveryLimit, 64; got != want {
+		t.Fatalf("UploadRecoveryLimit = %d, want %d", got, want)
+	}
+	if got, want := cfg.ShutdownTimeout, 15*time.Second; got != want {
+		t.Fatalf("ShutdownTimeout = %s, want %s", got, want)
+	}
 	if got, want := cfg.MaxRequestBodyBytes, int64(64<<20); got != want {
 		t.Fatalf("MaxRequestBodyBytes = %d, want %d", got, want)
 	}
@@ -61,6 +67,7 @@ func TestDefaultRejectsZeroAndNegativeLimits(t *testing.T) {
 		{"download concurrency", func(c *Config, v int) { c.DownloadConcurrency = v }},
 		{"per-user upload concurrency", func(c *Config, v int) { c.PerUserUploadConcurrency = v }},
 		{"per-IP upload concurrency", func(c *Config, v int) { c.PerIPUploadConcurrency = v }},
+		{"upload recovery limit", func(c *Config, v int) { c.UploadRecoveryLimit = v }},
 		{"max request body bytes", func(c *Config, v int) { c.MaxRequestBodyBytes = int64(v) }},
 	}
 
@@ -74,5 +81,13 @@ func TestDefaultRejectsZeroAndNegativeLimits(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestValidateRejectsRecoveryLimitAboveHardBound(t *testing.T) {
+	cfg := Default()
+	cfg.UploadRecoveryLimit = 65
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate accepted an unbounded recovery limit")
 	}
 }

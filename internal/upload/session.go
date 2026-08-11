@@ -303,6 +303,9 @@ type RecoveryReport struct{ Checked, Kept, Cancelled, Orphans int }
 // transitioned through cleanup, never reported as writable. The scan is
 // bounded and suitable for a background startup job, not a request handler.
 func (m *Manager) Recover(ctx context.Context, limit int, dryRun bool) (RecoveryReport, error) {
+	if err := ctx.Err(); err != nil {
+		return RecoveryReport{}, err
+	}
 	if limit <= 0 || limit > 64 {
 		limit = 64
 	}
@@ -312,6 +315,9 @@ func (m *Manager) Recover(ctx context.Context, limit int, dryRun bool) (Recovery
 	}
 	report := RecoveryReport{Checked: len(names)}
 	for _, name := range names {
+		if err := ctx.Err(); err != nil {
+			return report, err
+		}
 		id := strings.TrimSuffix(strings.TrimPrefix(name, "staging/"), ".part")
 		s, err := m.repo.UploadSessionByID(ctx, id)
 		if errors.Is(err, db.ErrNotFound) {
