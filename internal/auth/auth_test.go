@@ -368,3 +368,25 @@ func TestSessionManagerGCTimeoutCancelsBlockingStore(t *testing.T) {
 		t.Fatal("GC timeout did not release blocking store")
 	}
 }
+
+func TestSessionManagerParentLifecycleCancellationStopsGC(t *testing.T) {
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := &contextBlockingSessionStore{SessionStore: auth.NewMemorySessionStore(), entered: make(chan struct{}, 1), exited: make(chan struct{})}
+	manager := auth.NewSessionManager(store, auth.SessionConfig{TTL: time.Hour, LifecycleContext: parent, GCDeleteTimeout: time.Hour})
+	defer manager.Close()
+	if _, err := manager.Create(context.Background(), 1); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	select {
+	case <-store.entered:
+	case <-time.After(time.Second):
+		t.Fatal("GC did not enter DeleteExpired")
+	}
+	cancel()
+	select {
+	case <-store.exited:
+	case <-time.After(time.Second):
+		t.Fatal("parent lifecycle cancellation did not stop GC")
+	}
+}
