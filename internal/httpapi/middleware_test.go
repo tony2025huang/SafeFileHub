@@ -150,25 +150,34 @@ func TestUploadBodyLimitsClosesBlockingBodyOnIdleTimeoutAndReleasesLease(t *test
 		t.Fatal(err)
 	}
 	body := newBlockingReadCloser()
-	done := make(chan error, 1)
+	readDone := make(chan error, 1)
+	served := make(chan struct{})
 	h := UploadBodyLimits(20*time.Millisecond, 1024, LimitUpload(limiter, time.Second,
 		func(*http.Request) (string, string) { return "alice", "192.0.2.1" },
-		http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { _, err := r.Body.Read(make([]byte, 1)); done <- err })))
+		http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { _, err := r.Body.Read(make([]byte, 1)); readDone <- err })))
 	req := httptest.NewRequest(http.MethodPost, "/uploads", nil)
 	req.Body = body
-	go h.ServeHTTP(httptest.NewRecorder(), req)
+	go func() {
+		h.ServeHTTP(httptest.NewRecorder(), req)
+		close(served)
+	}()
 	select {
 	case <-body.started:
 	case <-time.After(time.Second):
 		t.Fatal("read did not start")
 	}
 	select {
-	case err := <-done:
+	case err := <-readDone:
 		if err == nil {
 			t.Fatal("blocking read unexpectedly succeeded")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("blocking read was not interrupted")
+	}
+	select {
+	case <-served:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not return after interrupted read")
 	}
 	if lease, err := limiter.TryAcquire("alice", "192.0.2.1"); err != nil {
 		t.Fatalf("lease was not released: %v", err)
