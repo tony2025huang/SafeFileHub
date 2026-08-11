@@ -1,126 +1,101 @@
-# SafeFileHub operations guide
+# SafeFileHub 运维指南
 
-## Deployment boundary
+## 部署边界与 trusted proxy
 
-Terminate TLS at a maintained reverse proxy (for example nginx, Caddy, Envoy, or a managed load balancer). Redirect HTTP to HTTPS, use modern TLS defaults, cap request bodies, and pass `X-Forwarded-*` only from explicitly trusted proxy addresses. SafeFileHub intentionally uses the socket peer address until trusted-proxy support is configured; do not trust client-supplied forwarding headers.
+在维护中的反向代理（Nginx、Caddy、Envoy 或托管 LB）终止 TLS，HTTP 重定向到 HTTPS。SafeFileHub 应绑定 loopback 或私网地址，不应直接暴露到公网；以非 root 用户、限制性 umask 运行。
 
-Bind SafeFileHub to a private address or loopback behind the proxy. The service is not intended for direct public exposure. Run it as a non-root account with a restrictive umask. `deploy/safefilehub.service.example` sets `ProtectSystem=strict`, a narrow writable path allowlist, and `LimitNOFILE=65536`.
+只在 SafeFileHub 的 **direct socket peer** 属于重复指定的 `--trusted-proxy-cidr` 之一时，才信任转发地址。收到可信 peer 的请求时，服务从 `X-Forwarded-For` 最右侧开始，跳过可信代理 hop，采用第一个非可信 IP；没有可用 XFF 时才使用合法的 `X-Real-IP`，仍没有时使用 direct peer。来自不可信 direct peer 的 `X-Forwarded-*` 与 `X-Real-IP` 均被忽略。因此 CIDR 只能填写实际会连接后端的代理网段，不能填写客户端网段或过宽网段。
 
-## Storage and backups
+Nginx 至少应传递：
 
-Provision separate paths/volumes for:
-
-1. **data** — SQLite metadata and completed opaque objects;
-2. **staging** — incomplete resumable upload parts and lifecycle locks.
-
-Use local durable storage. For atomic completion, staging and object storage must be on the same filesystem. Keep permissions private (`0700` directories and `0600` files). Do not browse or publish staging content.
-
-Back up SQLite consistently (use SQLite's supported backup mechanism or a filesystem snapshot coordinated with the service) together with completed object data. Treat this pair as one restore unit. Test restore into an isolated environment: restore data first, verify ownership/modes, start with `-recover-on-start=true`, then run authenticated integrity sampling. Never overwrite production from an untested backup.
-
-## Monitoring and capacity
-
-Alert before the volume is full; a full filesystem must cause writes to fail rather than silently accepting data. Track capacity and inode exhaustion for both data and staging. Monitor:
-
-- `/healthz` availability and latency; `/readyz` dependency failures;
-- open file descriptors (`/proc/<pid>/fd`, `lsof`, or service-manager accounting) against `LimitNOFILE`;
-- disk free space, inode free space, disk latency/queue depth, SQLite errors, and staging count/age;
-- process RSS, goroutines, request 429/503 responses, cancellation and cleanup counters;
-- upload/download concurrency and error rate.
-
-Investigate sustained staging growth: it normally means interrupted sessions, a cleanup failure, or insufficient capacity. Use the bounded startup recovery pass and preserve evidence before manual intervention.
-
-For high-bandwidth networks, evaluate BBR and CUBIC **in an isolated benchmark environment** with representative RTT/loss and reverse-proxy TLS. Record throughput, retransmits, CPU, disk wait, FD usage, and health latency. Do not change host sysctls automatically or assume one congestion-control algorithm is universally better.
-
-## Recovery, rollback, and cleanup
-
-On startup, SafeFileHub performs bounded upload reconciliation by default. For a no-write inspection:
-
-```sh
-safefilehub -recover-on-start=true -recover-only -recover-dry-run -recover-limit=64
+```nginx
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 ```
 
-For an actual bounded cleanup after reviewing monitoring and backup state:
+并以 `--trusted-proxy-cidr=127.0.0.1/32`、`--trusted-proxy-cidr=::1/128` 或实际代理网段启动服务。
+
+## 持久化存储与备份
+
+`data/` 是一个恢复单元：含 SQLite 元数据、完成 objects、`staging` 和 archive artifacts。必须使用本地、持久、可写并支持文件锁的 filesystem；生产环境不得使用 `tmpfs`。`staging` 必须和完成对象在同一 filesystem，完成上传依赖 atomic rename。SQLite 尝试启用 WAL，因此 WAL/SHM 文件也需要稳定目录和正确权限。
+
+建议目录由服务账号私有持有：
 
 ```sh
-safefilehub -recover-on-start=true -recover-only -recover-limit=64
+install -d -o safefilehub -g safefilehub -m 0700 /var/lib/safefilehub/data
+install -d -o root -g safefilehub -m 0770 /var/log/safefilehub
 ```
 
-Do not delete staging directories with broad shell commands. Recovery validates session metadata, regular files, offsets, expiry, and lifecycle locks; it removes only safe orphans/expired parts within its configured limit.
+SQLite 数据库与完成对象必须一起备份，使用 SQLite 支持的备份方式或与服务协调的 filesystem snapshot。先在隔离环境恢复该配对：检查 ownership/mode，启动 recovery，验证 `/healthz`、认证、列表、下载与 checksum 已验证的续传；不要将未经验证的备份覆盖生产。
 
-Rollback procedure:
+## 初始管理员与日志
 
-1. Drain or stop new traffic at the reverse proxy.
-2. Keep the current binary/image and data volumes intact; collect health, disk, and application logs without secrets.
-3. Deploy the prior tested binary/image and restart gracefully.
-4. Run bounded recovery, verify `/healthz`, authenticated listing/download, and a checksum-verified resumed upload.
-5. If metadata/object consistency is in doubt, restore the matched SQLite/object backup pair to an isolated environment first. Escalate rather than deleting objects or staging parts manually.
+空数据库第一次启动自动生成随机 `sfh-*` 管理员用户名和高强度密码，并只输出一次。普通重启不会轮换；数据库只保存 Argon2id hash。初始凭据会出现在进程初始化日志中，必须在首次启动前保护日志文件和 journal 访问权限。
 
-## Release gate
+`--reset-initial-admin` 是 break-glass 操作：它仅重置 `users.id=1`、启用该账号、打印新的随机凭据，然后退出，绝不会启动 HTTP；id 1 不存在时失败。
 
-Before a release, run:
+应用事件总是写 stderr。设置 `--log-path=/var/log/safefilehub/app.json` 后，同一事件也写文件；服务创建该文件为 `0600`。推荐：
+
+```sh
+--log-format=json \
+--log-path=/var/log/safefilehub/app.json \
+--log-max-bytes=104857600 \
+--log-retention-days=30 \
+--log-backups=10
+```
+
+`--log-format` 只接受 `json|text`（默认 JSON）；`--log-retention-days=0` 和 `--log-max-bytes=0` 分别关闭按年龄、按大小轮转；`--log-backups=0` 关闭按数量清理，三个数值均不能为负。轮转副本使用 UTC 时间戳，仅轮转副本会被年龄/数量策略删除。没有 `--log-path` 时仅使用 stderr/journal 或容器日志。
+
+## 日志与审计矩阵
+
+| 操作 | 记录 |
+| --- | --- |
+| login、logout、文件列表、管理员 API、认证/授权拒绝 | 一条请求终态事件 |
+| upload、download、archive | `*.start` 与 `*.complete`，另有请求终态事件 |
+| 零字节 file create、directory create、file delete、directory delete | `*.start` 与 `*.complete`，另有请求终态事件 |
+
+终态/完成记录带 operation、route、status、success、request/session/transfer correlation ID（适用时）、client IP、peer IP、user ID（适用时）、bytes、duration。密码、cookie、Authorization、token、请求及文件内容、敏感 query 不写入应用日志；管理员的持久 audit 也不保存凭据。
+
+## Recovery、cleanup 与回滚
+
+默认启动前执行一次有界 upload reconciliation。检查但不改写：
+
+```sh
+safefilehub --recover-on-start=true --recover-only --recover-dry-run --recover-limit=64
+```
+
+实际有界 cleanup：
+
+```sh
+safefilehub --recover-on-start=true --recover-only --recover-limit=64
+```
+
+limit 范围为 `1..64`。不要用宽泛 shell 删除 staging。upload recovery 仅在有界范围内核对 session metadata、regular files、offset、expiry 和 lifecycle lock。
+
+已发布对象恢复同样在启动期间运行：零字节对象已创建但元数据写入失败时，durable cleanup job 会记录待删 object；删除文件先将文件标记为 tombstone，移除 object 后才 finalize 元数据。启动 recovery 会重试这两类工作，因此错误或崩溃时不要手工删除对象、tombstone 或 cleanup 记录。
+
+回滚步骤：
+
+1. 在反向代理停止新流量。
+2. 保留当前 binary/image 与 data，收集 health、磁盘和已脱敏应用日志。
+3. 部署之前验证过的 binary/image，优雅重启。
+4. 执行有界 recovery，验证 health、认证列表/下载和续传 checksum。
+5. 若元数据/对象一致性可疑，先在隔离环境恢复匹配的 SQLite/object 备份；不要直接删数据。
+
+## 监控与发布门禁
+
+监控 `/healthz`、`/readyz`、FD 与 `LimitNOFILE`、磁盘/ inode/IO 等待、SQLite 错误、staging 数量/年龄、RSS、429/503、取消与 cleanup 指标。staging 持续增长通常表示中断 session、cleanup 故障或容量不足，应先保留证据并运行有界 recovery。
+
+发布前：
 
 ```sh
 GOTOOLCHAIN=local /usr/local/go/bin/go test ./... -race -count=1
-go vet ./...
-go test ./... -cover
+GOTOOLCHAIN=local /usr/local/go/bin/go vet ./...
+GOTOOLCHAIN=local /usr/local/go/bin/go test ./... -cover
 npm test
 npm run build
 git diff --check
 docker build -t safefilehub:test .
 ```
 
-The stress suite covers 1/2/4/8/16 concurrent files, health responsiveness, and SHA-256 integrity. Run destructive disk-full and external-network exercises only in isolated disposable test environments; never fill a production filesystem to test error handling.
-
-## Bootstrap, logs, and reverse proxies
-
-First startup logs a one-time random initial-admin credential pair. Capture it from the protected service log. It is not stored in database audit data. Use `--reset-initial-admin` only as an explicit break-glass operation; it resets id 1 and exits before HTTP starts.
-
-Keep persistent `data/` on a durable volume (never tmpfs in production). Configure structured logs with JSON where possible and restrict access to the log file because the one-time bootstrap credential appears there. Request logs contain request IDs, client and peer addresses, status, byte count, and duration, but redact credentials, cookies, authorization values, content, and sensitive query data.
-
-Nginx must pass its direct peer address and append forwarding information:
-```
-proxy_set_header X-Real-IP $remote_addr;
-proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-```
-Set `--trusted-proxy-cidr` exclusively to the CIDR(s) from which Nginx connects. Otherwise SafeFileHub uses the direct peer and ignores spoofable headers.
-
-
-## File lifecycle API boundary
-
-Files become published only when an upload session is completed. A directory upload
-is represented as multiple upload sessions, one for each file. SafeFileHub does
-**not** expose standalone APIs to create or delete already-published files or
-directories. `DELETE /api/uploads/{id}` cancels an incomplete upload session and
-must not be interpreted as deleting a published file.
-
-## Audit event coverage
-
-Each request has one terminal structured request event, including login, logout,
-file listing, administration, and denied requests. Upload, download, and archive
-handlers additionally emit explicit `*.start` before handler execution and
-`*.complete` at success, failure, or cancellation. These lifecycle records carry
-request/session/transfer correlation IDs, resolved client and peer IPs, status,
-success, byte count, and duration; credentials, cookies, authorization data,
-request content, and sensitive query data are redacted.
-
-## Published object mutation API
-
-Published files are created **only** through the resumable upload completion API;
-there is deliberately no empty-file endpoint because every published `files` row
-must reference an immutable opaque object. Explicit logical directories are
-created with `POST /api/directories` body `{"root_id": 1, "path":"reports"}`
-and return `201` with `id`, `root_id`, and canonical `path`.
-
-`DELETE /api/files/{fileID}` removes one completed opaque object and then its
-metadata, requiring `delete` on that exact logical path. `DELETE
-/api/directories/{directoryID}` requires `delete` on the directory and is
-non-recursive: it returns `409` if any published file or explicit child
-directory exists. Both reject unauthenticated and unauthorized requests.
-`DELETE /api/uploads/{id}` remains only cancellation of an incomplete staging
-upload and never deletes a published file.
-
-The structured log matrix includes `directory.create.start|complete`,
-`file.delete.start|complete`, and `directory.delete.start|complete`, plus their
-terminal request records. Each includes operation, success/status, client_ip,
-peer_ip, request_id, and session_audit_id; request content, cookies, tokens and
-other sensitive fields remain excluded.
+仅在隔离 benchmark 环境评估 BBR/CUBIC；不要以本地测试替代生产网络结论，也不要为测试填满生产 filesystem。

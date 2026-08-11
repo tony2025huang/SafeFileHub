@@ -1,5 +1,5 @@
-# Copy to /etc/systemd/system/safefilehub.service after setting paths/user.
-# data contains SQLite, objects, staging, and archive artifacts; keep it on one filesystem for atomic publication.
+# Copy to /etc/systemd/system/safefilehub.service after setting binary/user/group/paths.
+# data contains SQLite (WAL files), objects, staging, and archive artifacts; keep all on one persistent filesystem.
 [Unit]
 Description=SafeFileHub
 After=network-online.target
@@ -10,23 +10,21 @@ Type=simple
 User=safefilehub
 Group=safefilehub
 WorkingDirectory=/var/lib/safefilehub
-ExecStart=/usr/local/bin/safefilehub -recover-on-start=true
+# stderr stays available to journald. --log-path mirrors application logs to a private rotating file.
+ExecStart=/usr/local/bin/safefilehub --recover-on-start=true --log-format=json --log-path=/var/log/safefilehub/app.json --log-max-bytes=104857600 --log-retention-days=30 --log-backups=10 --trusted-proxy-cidr=127.0.0.1/32 --trusted-proxy-cidr=::1/128
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/lib/safefilehub/data
+ReadWritePaths=/var/lib/safefilehub/data /var/log/safefilehub
 LimitNOFILE=65536
 UMask=0077
-# Supply application configuration using the approved deployment mechanism;
-# never place passwords or session material in this unit.
+# Create /var/lib/safefilehub/data as safefilehub:safefilehub mode 0700.
+# Create /var/log/safefilehub as root:safefilehub mode 0770 before starting.
+# Change/remove trusted-proxy CIDRs if the service is not directly behind those proxies.
+# Never place passwords or session material in this unit.
 
 [Install]
 WantedBy=multi-user.target
-
-# Logging/reverse proxy example (append flags to ExecStart as appropriate):
-# --log-path=/var/log/safefilehub/app.json --log-format=json --log-retention-days=30 \
-# --trusted-proxy-cidr=127.0.0.1/32 --trusted-proxy-cidr=::1/128
-# Keep WorkingDirectory/data on persistent disk; do not use tmpfs for production data.
