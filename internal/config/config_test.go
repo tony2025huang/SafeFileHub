@@ -38,6 +38,12 @@ func TestDefaultConfiguration(t *testing.T) {
 	if got, want := cfg.UploadSessionTTL, 24*time.Hour; got != want {
 		t.Fatalf("UploadSessionTTL = %s, want %s", got, want)
 	}
+	if got, want := cfg.MaxRequestBodyBytes, int64(64<<20); got != want {
+		t.Fatalf("MaxRequestBodyBytes = %d, want %d", got, want)
+	}
+	if got, want := cfg.RequestIdleTimeout, 30*time.Minute; got != want {
+		t.Fatalf("RequestIdleTimeout = %s, want %s", got, want)
+	}
 	if !cfg.NamePolicy.RejectLeadingDot || !cfg.NamePolicy.RejectLeadingTilde || !cfg.NamePolicy.RejectLeadingDollar || !cfg.NamePolicy.RejectLeadingHash {
 		t.Fatal("default name policy must reject configured special leading characters")
 	}
@@ -55,6 +61,7 @@ func TestDefaultRejectsZeroAndNegativeLimits(t *testing.T) {
 		{"download concurrency", func(c *Config, v int) { c.DownloadConcurrency = v }},
 		{"per-user upload concurrency", func(c *Config, v int) { c.PerUserUploadConcurrency = v }},
 		{"per-IP upload concurrency", func(c *Config, v int) { c.PerIPUploadConcurrency = v }},
+		{"max request body bytes", func(c *Config, v int) { c.MaxRequestBodyBytes = int64(v) }},
 	}
 
 	for _, tc := range cases {

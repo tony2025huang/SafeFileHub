@@ -33,7 +33,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	server := &http.Server{Addr: cfg.ListenAddr, Handler: h}
+	server := httpapi.ServerTimeouts(cfg, h)
 	go func() {
 		<-lifecycle.Done()
 		_ = server.Close()

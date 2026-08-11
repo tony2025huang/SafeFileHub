@@ -28,6 +28,10 @@ type Config struct {
 
 	UploadIdleTimeout time.Duration
 	UploadSessionTTL  time.Duration
+	// MaxRequestBodyBytes bounds HTTP request bodies before handlers read them.
+	MaxRequestBodyBytes int64
+	// RequestIdleTimeout bounds the lifetime of an individual request handler.
+	RequestIdleTimeout time.Duration
 
 	NamePolicy NamePolicy
 }
@@ -45,6 +49,8 @@ func Default() Config {
 		ChunkSize:                8 << 20,
 		UploadIdleTimeout:        30 * time.Minute,
 		UploadSessionTTL:         24 * time.Hour,
+		MaxRequestBodyBytes:      64 << 20,
+		RequestIdleTimeout:       30 * time.Minute,
 		NamePolicy: NamePolicy{
 			RejectLeadingDot:    true,
 			RejectLeadingTilde:  true,
@@ -85,6 +91,12 @@ func (c Config) Validate() error {
 	}
 	if c.UploadSessionTTL <= 0 {
 		return fmt.Errorf("upload session TTL must be positive")
+	}
+	if c.MaxRequestBodyBytes <= 0 {
+		return fmt.Errorf("max request body bytes must be positive")
+	}
+	if c.RequestIdleTimeout <= 0 {
+		return fmt.Errorf("request idle timeout must be positive")
 	}
 	return nil
 }
