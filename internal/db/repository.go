@@ -149,6 +149,18 @@ func (r *Repository) CreateFile(ctx context.Context, file File) (File, error) {
 	return file, nil
 }
 
+// FileByID returns a single completed-file metadata row by its opaque API ID.
+func (r *Repository) FileByID(ctx context.Context, id int64) (File, error) {
+	var file File
+	var createdAt, updatedAt int64
+	err := r.db.QueryRowContext(ctx, `SELECT id, root_id, logical_path, object_key, size, created_by_user_id, created_at, updated_at FROM files WHERE id = ?`, id).Scan(&file.ID, &file.RootID, &file.LogicalPath, &file.ObjectKey, &file.Size, &file.CreatedByUserID, &createdAt, &updatedAt)
+	if err != nil {
+		return File{}, classifyError(err)
+	}
+	file.CreatedAt, file.UpdatedAt = fromUnixNano(createdAt), fromUnixNano(updatedAt)
+	return file, nil
+}
+
 func (r *Repository) FileByRootAndPath(ctx context.Context, rootID int64, logicalPath string) (File, error) {
 	var file File
 	var createdAt, updatedAt int64
