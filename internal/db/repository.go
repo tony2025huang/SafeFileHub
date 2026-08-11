@@ -42,6 +42,38 @@ type File struct {
 	CreatedByUserID int64
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
+	MD5Status       string
+	MD5Digest       string
+	MD5Error        string
+}
+
+const (
+	MD5Disabled  = "disabled"
+	MD5Pending   = "pending"
+	MD5Computing = "computing"
+	MD5Ready     = "ready"
+	MD5Failed    = "failed"
+)
+
+type SiteSettings struct {
+	SiteName, PrimaryColor, FilingText               string
+	FilingEnabled, MD5Enabled                        bool
+	LoginLogoAssetID, NavLogoAssetID, FaviconAssetID int64
+	CreatedAt, UpdatedAt                             time.Time
+}
+
+type SiteAsset struct {
+	ID                           int64
+	Kind, OpaqueKey, ContentType string
+	Size, Width, Height          int64
+	CreatedAt, UpdatedAt         time.Time
+}
+
+type MD5Task struct {
+	FileID                 int64
+	Status                 string
+	Attempts, MaxAttempts  int
+	AvailableAt, ClaimedAt time.Time
 }
 
 type Directory struct {
@@ -89,6 +121,218 @@ type AuditEvent struct {
 	Detail      string
 	Status      int
 	CreatedAt   time.Time
+}
+
+func (r *Repository) SiteSettings(ctx context.Context) (SiteSettings, error) {
+	var s SiteSettings
+	var filing, md5 int
+	var login, nav, favicon sql.NullInt64
+	var created, updated int64
+	err := r.db.QueryRowContext(ctx, `SELECT site_name, primary_color, filing_enabled, filing_text, md5_enabled, login_logo_asset_id, nav_logo_asset_id, favicon_asset_id, created_at, updated_at FROM site_settings WHERE id=1`).Scan(&s.SiteName, &s.PrimaryColor, &filing, &s.FilingText, &md5, &login, &nav, &favicon, &created, &updated)
+	if err != nil {
+		return SiteSettings{}, classifyError(err)
+	}
+	s.FilingEnabled, s.MD5Enabled = filing != 0, md5 != 0
+	s.LoginLogoAssetID, s.NavLogoAssetID, s.FaviconAssetID = login.Int64, nav.Int64, favicon.Int64
+	s.CreatedAt, s.UpdatedAt = fromUnixNano(created), fromUnixNano(updated)
+	return s, nil
+}
+
+func validSiteSettings(s SiteSettings) bool {
+	if strings.TrimSpace(s.SiteName) == "" || len(s.SiteName) > 200 || len(s.FilingText) > 500 {
+		return false
+	}
+	if len(s.PrimaryColor) != 7 || s.PrimaryColor[0] != '#' {
+		return false
+	}
+	for _, c := range s.PrimaryColor[1:] {
+		if !strings.ContainsRune("0123456789abcdefABCDEF", c) {
+			return false
+		}
+	}
+	return true
+}
+func (r *Repository) UpdateSiteSettings(ctx context.Context, s SiteSettings) error {
+	if !validSiteSettings(s) {
+		return errors.New("invalid site settings")
+	}
+	result, err := r.db.ExecContext(ctx, `UPDATE site_settings SET site_name=?, primary_color=?, filing_enabled=?, filing_text=?, md5_enabled=?, login_logo_asset_id=NULLIF(?,0), nav_logo_asset_id=NULLIF(?,0), favicon_asset_id=NULLIF(?,0), updated_at=? WHERE id=1`, s.SiteName, s.PrimaryColor, boolInt(s.FilingEnabled), s.FilingText, boolInt(s.MD5Enabled), s.LoginLogoAssetID, s.NavLogoAssetID, s.FaviconAssetID, unixNano(time.Now().UTC()))
+	if err != nil {
+		return classifyError(err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateSiteSettingsWithAudit makes an administrative settings change visible
+// only when its corresponding audit event is durable too.
+func (r *Repository) UpdateSiteSettingsWithAudit(ctx context.Context, s SiteSettings, event AuditEvent) error {
+	if !validSiteSettings(s) {
+		return errors.New("invalid site settings")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE site_settings SET site_name=?, primary_color=?, filing_enabled=?, filing_text=?, md5_enabled=?, login_logo_asset_id=NULLIF(?,0), nav_logo_asset_id=NULLIF(?,0), favicon_asset_id=NULLIF(?,0), updated_at=? WHERE id=1`, s.SiteName, s.PrimaryColor, boolInt(s.FilingEnabled), s.FilingText, boolInt(s.MD5Enabled), s.LoginLogoAssetID, s.NavLogoAssetID, s.FaviconAssetID, unixNano(time.Now().UTC()))
+	if err != nil {
+		return classifyError(err)
+	}
+	if n, err := result.RowsAffected(); err != nil {
+		return err
+	} else if n != 1 {
+		return ErrNotFound
+	}
+	if err := createAuditEventTx(ctx, tx, event); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+func validAssetKind(kind string) bool {
+	return kind == "login_logo" || kind == "nav_logo" || kind == "favicon"
+}
+func (r *Repository) ReplaceSiteAsset(ctx context.Context, kind string, a SiteAsset) (SiteAsset, error) {
+	return r.replaceSiteAsset(ctx, kind, a, nil)
+}
+
+// ReplaceSiteAssetWithAudit atomically publishes an asset and records its
+// audit event. The previous unreferenced file is queued for safe cleanup.
+func (r *Repository) ReplaceSiteAssetWithAudit(ctx context.Context, kind string, a SiteAsset, event AuditEvent) (SiteAsset, error) {
+	return r.replaceSiteAsset(ctx, kind, a, &event)
+}
+
+// ResetSiteAssetWithAudit restores the built-in branding fallback by removing
+// the configured custom asset, queuing its opaque file for durable cleanup,
+// and recording the administrative action in the same transaction.
+func (r *Repository) ResetSiteAssetWithAudit(ctx context.Context, kind string, event AuditEvent) error {
+	if !validAssetKind(kind) {
+		return errors.New("invalid site asset")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	column := map[string]string{"login_logo": "login_logo_asset_id", "nav_logo": "nav_logo_asset_id", "favicon": "favicon_asset_id"}[kind]
+	var old sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT `+column+` FROM site_settings WHERE id=1`).Scan(&old); err != nil {
+		return classifyError(err)
+	}
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `UPDATE site_settings SET `+column+`=NULL,updated_at=? WHERE id=1`, unixNano(now)); err != nil {
+		return err
+	}
+	if old.Valid {
+		var key string
+		if err := tx.QueryRowContext(ctx, `SELECT opaque_key FROM site_assets WHERE id=?`, old.Int64).Scan(&key); err != nil {
+			return classifyError(err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM site_assets WHERE id=?`, old.Int64); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO site_asset_cleanup(opaque_key,created_at) VALUES(?,?)`, key, unixNano(now)); err != nil {
+			return err
+		}
+	}
+	if err := createAuditEventTx(ctx, tx, event); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+func (r *Repository) replaceSiteAsset(ctx context.Context, kind string, a SiteAsset, event *AuditEvent) (SiteAsset, error) {
+	if !validAssetKind(kind) || a.OpaqueKey == "" || a.ContentType == "" || a.Size < 0 || a.Width <= 0 || a.Height <= 0 {
+		return SiteAsset{}, errors.New("invalid site asset")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return SiteAsset{}, err
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC()
+	result, err := tx.ExecContext(ctx, `INSERT INTO site_assets(kind,opaque_key,content_type,size,width,height,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`, kind, a.OpaqueKey, a.ContentType, a.Size, a.Width, a.Height, unixNano(now), unixNano(now))
+	if err != nil {
+		return SiteAsset{}, classifyError(err)
+	}
+	a.ID, err = result.LastInsertId()
+	if err != nil {
+		return SiteAsset{}, err
+	}
+	a.Kind, a.CreatedAt, a.UpdatedAt = kind, now, now
+	column := map[string]string{"login_logo": "login_logo_asset_id", "nav_logo": "nav_logo_asset_id", "favicon": "favicon_asset_id"}[kind]
+	var old sql.NullInt64
+	if err = tx.QueryRowContext(ctx, `SELECT `+column+` FROM site_settings WHERE id=1`).Scan(&old); err != nil {
+		return SiteAsset{}, err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE site_settings SET `+column+`=?,updated_at=? WHERE id=1`, a.ID, unixNano(now)); err != nil {
+		return SiteAsset{}, err
+	}
+	if old.Valid {
+		var oldKey string
+		if err = tx.QueryRowContext(ctx, `SELECT opaque_key FROM site_assets WHERE id=?`, old.Int64).Scan(&oldKey); err != nil {
+			return SiteAsset{}, err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM site_assets WHERE id=?`, old.Int64); err != nil {
+			return SiteAsset{}, err
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO site_asset_cleanup(opaque_key,created_at) VALUES(?,?)`, oldKey, unixNano(now)); err != nil {
+			return SiteAsset{}, err
+		}
+	}
+	if event != nil {
+		if err = createAuditEventTx(ctx, tx, *event); err != nil {
+			return SiteAsset{}, err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return SiteAsset{}, err
+	}
+	return a, nil
+}
+
+// SiteAssetCleanupKeys returns a bounded set of no-longer-referenced files.
+func (r *Repository) SiteAssetCleanupKeys(ctx context.Context, limit int) ([]string, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT opaque_key FROM site_asset_cleanup ORDER BY created_at,opaque_key LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	return keys, rows.Err()
+}
+func (r *Repository) CompleteSiteAssetCleanup(ctx context.Context, key string) error {
+	_, err := r.db.ExecContext(ctx, `DELETE FROM site_asset_cleanup WHERE opaque_key=?`, key)
+	return err
+}
+func (r *Repository) DeleteSiteAsset(ctx context.Context, id int64) error {
+	_, err := r.db.ExecContext(ctx, `DELETE FROM site_assets WHERE id=?`, id)
+	return err
+}
+func (r *Repository) PublicSiteAssetByID(ctx context.Context, id int64) (SiteAsset, error) {
+	var a SiteAsset
+	var c, u int64
+	err := r.db.QueryRowContext(ctx, `SELECT id,kind,opaque_key,content_type,size,width,height,created_at,updated_at FROM site_assets WHERE id=?`, id).Scan(&a.ID, &a.Kind, &a.OpaqueKey, &a.ContentType, &a.Size, &a.Width, &a.Height, &c, &u)
+	if err != nil {
+		return SiteAsset{}, classifyError(err)
+	}
+	a.CreatedAt, a.UpdatedAt = fromUnixNano(c), fromUnixNano(u)
+	return a, nil
 }
 
 func (r *Repository) CreateUser(ctx context.Context, user User) (User, error) {
@@ -205,7 +449,7 @@ func (r *Repository) CreateFile(ctx context.Context, file File) (File, error) {
 func (r *Repository) FileByID(ctx context.Context, id int64) (File, error) {
 	var file File
 	var createdAt, updatedAt int64
-	err := r.db.QueryRowContext(ctx, `SELECT id, root_id, logical_path, object_key, size, created_by_user_id, created_at, updated_at FROM files WHERE id = ? AND delete_state = 'active'`, id).Scan(&file.ID, &file.RootID, &file.LogicalPath, &file.ObjectKey, &file.Size, &file.CreatedByUserID, &createdAt, &updatedAt)
+	err := r.db.QueryRowContext(ctx, `SELECT id, root_id, logical_path, object_key, size, created_by_user_id, created_at, updated_at, md5_status, md5_digest, md5_error FROM files WHERE id = ? AND delete_state = 'active'`, id).Scan(&file.ID, &file.RootID, &file.LogicalPath, &file.ObjectKey, &file.Size, &file.CreatedByUserID, &createdAt, &updatedAt, &file.MD5Status, &file.MD5Digest, &file.MD5Error)
 	if err != nil {
 		return File{}, classifyError(err)
 	}
@@ -228,7 +472,7 @@ func (r *Repository) FileForDeletion(ctx context.Context, id int64) (File, error
 func (r *Repository) FileByRootAndPath(ctx context.Context, rootID int64, logicalPath string) (File, error) {
 	var file File
 	var createdAt, updatedAt int64
-	err := r.db.QueryRowContext(ctx, `SELECT id, root_id, logical_path, object_key, size, created_by_user_id, created_at, updated_at FROM files WHERE root_id = ? AND logical_path = ? AND delete_state = 'active'`, rootID, logicalPath).Scan(&file.ID, &file.RootID, &file.LogicalPath, &file.ObjectKey, &file.Size, &file.CreatedByUserID, &createdAt, &updatedAt)
+	err := r.db.QueryRowContext(ctx, `SELECT id, root_id, logical_path, object_key, size, created_by_user_id, created_at, updated_at, md5_status, md5_digest, md5_error FROM files WHERE root_id = ? AND logical_path = ? AND delete_state = 'active'`, rootID, logicalPath).Scan(&file.ID, &file.RootID, &file.LogicalPath, &file.ObjectKey, &file.Size, &file.CreatedByUserID, &createdAt, &updatedAt, &file.MD5Status, &file.MD5Digest, &file.MD5Error)
 	if err != nil {
 		return File{}, classifyError(err)
 	}
@@ -574,8 +818,26 @@ func (r *Repository) CompleteUpload(ctx context.Context, file File, sessionID st
 	if file.UpdatedAt.IsZero() {
 		updated = created
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO files (root_id, logical_path, object_key, size, created_by_user_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, file.RootID, file.LogicalPath, file.ObjectKey, file.Size, file.CreatedByUserID, unixNano(created), unixNano(updated)); err != nil {
+	var md5Enabled int
+	if err = tx.QueryRowContext(ctx, `SELECT md5_enabled FROM site_settings WHERE id=1`).Scan(&md5Enabled); err != nil {
+		return err
+	}
+	status := MD5Disabled
+	if md5Enabled != 0 {
+		status = MD5Pending
+	}
+	result, err = tx.ExecContext(ctx, `INSERT INTO files (root_id, logical_path, object_key, size, created_by_user_id, created_at, updated_at, md5_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, file.RootID, file.LogicalPath, file.ObjectKey, file.Size, file.CreatedByUserID, unixNano(created), unixNano(updated), status)
+	if err != nil {
 		return classifyError(err)
+	}
+	if md5Enabled != 0 {
+		id, e := result.LastInsertId()
+		if e != nil {
+			return e
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO md5_tasks(file_id,status,attempts,max_attempts,available_at,created_at,updated_at) VALUES (?,'pending',0,3,?,?,?)`, id, unixNano(created), unixNano(created), unixNano(updated)); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit complete upload: %w", err)
@@ -599,16 +861,11 @@ func (r *Repository) DeleteUploadSession(ctx context.Context, id string) error {
 }
 
 func (r *Repository) CreateAuditEvent(ctx context.Context, event AuditEvent) (AuditEvent, error) {
-	event.Detail = redactAuditDetail(event.Detail)
-	if event.Status == 0 {
-		event.Status = auditStatus(event.Detail)
+	event, err := prepareAuditEvent(event)
+	if err != nil {
+		return AuditEvent{}, err
 	}
-	createdAt := utcOrNow(event.CreatedAt)
-	var rootID any = event.RootID
-	if event.RootID == 0 {
-		rootID = nil
-	}
-	result, err := r.db.ExecContext(ctx, `INSERT INTO audit_events (user_id, root_id, action, logical_path, detail, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, event.UserID, rootID, event.Action, event.LogicalPath, event.Detail, event.Status, unixNano(createdAt))
+	result, err := r.db.ExecContext(ctx, `INSERT INTO audit_events (user_id, root_id, action, logical_path, detail, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, event.UserID, nullableRootID(event.RootID), event.Action, event.LogicalPath, event.Detail, event.Status, unixNano(event.CreatedAt))
 	if err != nil {
 		return AuditEvent{}, classifyError(err)
 	}
@@ -616,8 +873,32 @@ func (r *Repository) CreateAuditEvent(ctx context.Context, event AuditEvent) (Au
 	if err != nil {
 		return AuditEvent{}, fmt.Errorf("get created audit event id: %w", err)
 	}
-	event.CreatedAt = createdAt
 	return event, nil
+}
+func prepareAuditEvent(event AuditEvent) (AuditEvent, error) {
+	event.Detail = redactAuditDetail(event.Detail)
+	if event.Status == 0 {
+		event.Status = auditStatus(event.Detail)
+	}
+	event.CreatedAt = utcOrNow(event.CreatedAt)
+	return event, nil
+}
+func nullableRootID(id int64) any {
+	if id == 0 {
+		return nil
+	}
+	return id
+}
+func createAuditEventTx(ctx context.Context, tx *sql.Tx, event AuditEvent) error {
+	event, err := prepareAuditEvent(event)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO audit_events (user_id, root_id, action, logical_path, detail, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, event.UserID, nullableRootID(event.RootID), event.Action, event.LogicalPath, event.Detail, event.Status, unixNano(event.CreatedAt))
+	if err != nil {
+		return classifyError(err)
+	}
+	return nil
 }
 
 // redactAuditDetail preserves only non-sensitive operational metadata. Audit
@@ -734,4 +1015,87 @@ func classifyError(err error) error {
 		return fmt.Errorf("%w: %v", ErrConflict, err)
 	}
 	return err
+}
+
+// ClaimMD5Task atomically reserves one due task. The single UPDATE predicate
+// makes a task unavailable to every other SQLite connection before it is read.
+func (r *Repository) ClaimMD5Task(ctx context.Context) (MD5Task, error) {
+	now := unixNano(time.Now().UTC())
+	row := r.db.QueryRowContext(ctx, `UPDATE md5_tasks SET status='computing', attempts=attempts+1, claimed_at=?, updated_at=? WHERE file_id=(SELECT file_id FROM md5_tasks WHERE status='pending' AND available_at<=? ORDER BY available_at,file_id LIMIT 1) AND status='pending' RETURNING file_id,status,attempts,max_attempts,available_at,claimed_at`, now, now, now)
+	var t MD5Task
+	var available, claimed sql.NullInt64
+	if err := row.Scan(&t.FileID, &t.Status, &t.Attempts, &t.MaxAttempts, &available, &claimed); err != nil {
+		return MD5Task{}, classifyError(err)
+	}
+	t.AvailableAt = fromUnixNano(available.Int64)
+	if claimed.Valid {
+		t.ClaimedAt = fromUnixNano(claimed.Int64)
+	}
+	return t, nil
+}
+func (r *Repository) CompleteMD5Task(ctx context.Context, fileID int64, digest string) error {
+	if len(digest) != 32 {
+		return errors.New("invalid md5 digest")
+	}
+	for _, c := range digest {
+		if !strings.ContainsRune("0123456789abcdef", c) {
+			return errors.New("invalid md5 digest")
+		}
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE md5_tasks SET status='complete',updated_at=? WHERE file_id=? AND status='computing'`, unixNano(time.Now().UTC()), fileID)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return ErrNotFound
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE files SET md5_status='ready',md5_digest=?,md5_error='',updated_at=? WHERE id=?`, digest, unixNano(time.Now().UTC()), fileID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+func (r *Repository) FailMD5Task(ctx context.Context, fileID int64, message string) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := unixNano(time.Now().UTC())
+	result, err := tx.ExecContext(ctx, `UPDATE md5_tasks SET status=CASE WHEN attempts>=max_attempts THEN 'failed' ELSE 'pending' END, available_at=?, claimed_at=NULL, updated_at=? WHERE file_id=? AND status='computing'`, now, now, fileID)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return ErrNotFound
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE files SET md5_status=CASE WHEN (SELECT status FROM md5_tasks WHERE file_id=?)='failed' THEN 'failed' ELSE 'pending' END,md5_error=?,updated_at=? WHERE id=?`, fileID, message, now, fileID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// RequeueComputingMD5Tasks recovers at most limit interrupted claims on startup.
+func (r *Repository) RequeueComputingMD5Tasks(ctx context.Context, limit int) (int, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	result, err := r.db.ExecContext(ctx, `UPDATE md5_tasks SET status='pending',claimed_at=NULL,available_at=?,updated_at=? WHERE file_id IN (SELECT file_id FROM md5_tasks WHERE status='computing' ORDER BY claimed_at,file_id LIMIT ?)`, unixNano(time.Now().UTC()), unixNano(time.Now().UTC()), limit)
+	if err != nil {
+		return 0, err
+	}
+	n, err := result.RowsAffected()
+	return int(n), err
 }

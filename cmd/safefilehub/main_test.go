@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/example/safefilehub/internal/config"
 	"github.com/example/safefilehub/internal/db"
@@ -85,6 +87,78 @@ func TestRunRecoverOnlyTreatsContextCancellationAsGraceful(t *testing.T) {
 	cancel()
 	if err := runWithLifecycle(ctx, []string{"-recover-only"}, cfg); err != nil {
 		t.Fatalf("runWithLifecycle() error = %v, want nil for cancellation", err)
+	}
+}
+
+type blockingMD5Worker struct{ stopped chan struct{} }
+
+func (w blockingMD5Worker) Run(ctx context.Context, _ time.Duration) error {
+	<-ctx.Done()
+	close(w.stopped)
+	return nil
+}
+
+func TestMD5WorkerLifecycleStopsAndWaits(t *testing.T) {
+	worker := blockingMD5Worker{stopped: make(chan struct{})}
+	stop := startMD5Worker(context.Background(), worker, time.Hour)
+	stop()
+	stop() // Shutdown may be reached through more than one cleanup path.
+	select {
+	case <-worker.stopped:
+	default:
+		t.Fatal("stop returned before MD5 worker exited")
+	}
+}
+
+type lifecycleServer struct {
+	shutdown chan struct{}
+}
+
+func (s lifecycleServer) Shutdown(context.Context) error {
+	close(s.shutdown)
+	return nil
+}
+
+func TestServeWithLifecycleGracefullyShutsDownAndWaits(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server := lifecycleServer{shutdown: make(chan struct{})}
+	serveExited := make(chan struct{})
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- serveWithLifecycle(ctx, time.Second, server, func() error {
+			<-server.shutdown
+			close(serveExited)
+			return http.ErrServerClosed
+		})
+	}()
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("serveWithLifecycle() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("serveWithLifecycle did not complete graceful shutdown")
+	}
+	select {
+	case <-serveExited:
+	default:
+		t.Fatal("serveWithLifecycle returned before serving goroutine exited")
+	}
+}
+
+func TestServeWithLifecycleReleasesWatcherAfterStartupFailure(t *testing.T) {
+	server := lifecycleServer{shutdown: make(chan struct{})}
+	want := errors.New("listen failed")
+	if err := serveWithLifecycle(context.Background(), time.Second, server, func() error { return want }); !errors.Is(err, want) {
+		t.Fatalf("serveWithLifecycle() error = %v, want wrapped %v", err, want)
+	}
+	select {
+	case <-server.shutdown:
+		t.Fatal("shutdown called after startup failure")
+	default:
 	}
 }
 

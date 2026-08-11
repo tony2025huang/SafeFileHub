@@ -12,6 +12,7 @@ import (
 	"github.com/example/safefilehub/internal/config"
 	"github.com/example/safefilehub/internal/limits"
 	"github.com/example/safefilehub/internal/metrics"
+	"github.com/example/safefilehub/internal/siteassets"
 	"github.com/example/safefilehub/internal/storage"
 	"github.com/example/safefilehub/internal/upload"
 )
@@ -54,7 +55,7 @@ func NewProductionServer(cfg config.Config, users authenticator, sessions userSe
 	uploadRepository
 	downloadRepository
 	archiveRepository
-	adminRepository
+	siteSettingsRepository
 	publishedRepository
 }, authorizer interface {
 	uploadAuthorizer
@@ -73,6 +74,10 @@ func NewProductionServer(cfg config.Config, users authenticator, sessions userSe
 		return nil, err
 	}
 	uploads := upload.New(repo, store, cfg.ChunkSize, cfg.UploadSessionTTL)
+	siteAssetStore, err := siteassets.New(cfg.StorageRoot, siteassets.Limits{MaxBytes: 8 << 20, MaxPixels: 20_000_000})
+	if err != nil {
+		return nil, err
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthz)
 	mux.HandleFunc("GET /readyz", readyz(checks))
@@ -100,6 +105,7 @@ func NewProductionServer(cfg config.Config, users authenticator, sessions userSe
 	mux.Handle("GET /api/archives/{jobID}", requireSession(sessions, logTransferLifecycle("archive", observeArchive(observability, http.HandlerFunc(downloadArchive(archives))))))
 	mux.Handle("DELETE /api/archives/{jobID}", requireSession(sessions, observeCancellation(observability, http.HandlerFunc(cancelArchive(archives)))))
 	registerAdminRoutes(mux, cfg, sessions, repo)
+	registerSiteSettingsRoutes(mux, cfg, sessions, repo, siteAssetStore)
 	return observedHandler(cfg, mux, observability), nil
 }
 

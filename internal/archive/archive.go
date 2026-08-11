@@ -159,10 +159,11 @@ func (m *Manager) create(ctx context.Context, userID int64, root string, entries
 	default:
 		m.jobs[id] = j
 	}
+	job := j.Job
 	m.mu.Unlock()
 	select {
 	case m.tasks <- task{id: id, entries: append([]Entry(nil), entries...), ctx: jobctx}:
-		return j.Job, nil
+		return job, nil
 	case <-ctx.Done():
 		m.Cancel(id)
 		return Job{}, ctx.Err()

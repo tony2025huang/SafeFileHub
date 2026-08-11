@@ -11,11 +11,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/example/safefilehub/internal/archive"
 	"github.com/example/safefilehub/internal/auth"
+	"github.com/example/safefilehub/internal/checksum"
 	"github.com/example/safefilehub/internal/config"
 	"github.com/example/safefilehub/internal/db"
 	"github.com/example/safefilehub/internal/httpapi"
@@ -211,6 +213,10 @@ func runWithLifecycle(lifecycle context.Context, args []string, cfg config.Confi
 		return nil
 	}
 
+	md5Worker := checksum.NewWorker(repo, checksumObjectStore{store}, checksum.Options{Concurrency: 2, MaxTasksPerRun: 16, RecoveryLimit: opts.limit})
+	stopMD5Worker := startMD5Worker(lifecycle, md5Worker, time.Second)
+	defer stopMD5Worker()
+
 	archiveManager, err := archive.New(archive.Options{Workers: 2, MaxFiles: 1000, MaxBytes: 1 << 30, TTL: time.Hour, TempDir: cfg.StorageRoot + "/archives"}, httpapi.ObjectArchiveSource{Store: store})
 	if err != nil {
 		return err
@@ -224,16 +230,65 @@ func runWithLifecycle(lifecycle context.Context, args []string, cfg config.Confi
 	h = httpapi.WithApplicationLogger(appLog.NewMulti(sinks...), h)
 
 	server := httpapi.ServerTimeouts(cfg, h)
+	log.Printf("SafeFileHub listening on %s", cfg.ListenAddr)
+	return serveWithLifecycle(lifecycle, cfg.ShutdownTimeout, server, server.ListenAndServe)
+}
+
+type checksumObjectStore struct{ store *storage.ObjectStore }
+
+func (s checksumObjectStore) Open(key string) (io.ReadCloser, error) { return s.store.Open(key) }
+
+type md5WorkerRunner interface {
+	Run(context.Context, time.Duration) error
+}
+
+// startMD5Worker binds the worker lifetime to the process lifetime. Its stop
+// function cancels the worker and waits, so repository and object-store closes
+// cannot race a still-running checksum goroutine.
+func startMD5Worker(lifecycle context.Context, worker md5WorkerRunner, interval time.Duration) func() {
+	ctx, cancel := context.WithCancel(lifecycle)
+	done := make(chan struct{})
+	var stopOnce sync.Once
 	go func() {
-		<-lifecycle.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
-		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			log.Printf("SafeFileHub HTTP shutdown: %v", err)
+		defer close(done)
+		if err := worker.Run(ctx, interval); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("SafeFileHub MD5 worker stopped: %v", err)
 		}
 	}()
-	log.Printf("SafeFileHub listening on %s", cfg.ListenAddr)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	return func() {
+		stopOnce.Do(func() {
+			cancel()
+			<-done
+		})
+	}
+}
+
+type gracefulServer interface {
+	Shutdown(context.Context) error
+}
+
+// serveWithLifecycle pairs the HTTP serving and shutdown goroutines. In
+// particular, a startup failure releases the shutdown watcher instead of
+// leaving it blocked on a process lifecycle that may never be cancelled.
+func serveWithLifecycle(lifecycle context.Context, shutdownTimeout time.Duration, server gracefulServer, serve func() error) error {
+	serveDone := make(chan struct{})
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		select {
+		case <-lifecycle.Done():
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+			defer cancel()
+			if err := server.Shutdown(shutdownCtx); err != nil {
+				log.Printf("SafeFileHub HTTP shutdown: %v", err)
+			}
+		case <-serveDone:
+		}
+	}()
+	err := serve()
+	close(serveDone)
+	<-shutdownDone
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("SafeFileHub server: %w", err)
 	}
 	return nil

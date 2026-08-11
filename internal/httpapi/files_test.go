@@ -34,7 +34,7 @@ func TestListFilesRequiresSessionAndFiltersChildren(t *testing.T) {
 	defer sessions.Close()
 	rootDir := t.TempDir()
 	repo := listFilesRepo{root: db.StorageRoot{ID: 3, Path: rootDir}, files: []db.File{
-		{LogicalPath: "/docs/allowed.txt", ObjectKey: "objects/a", Size: 4},
+		{LogicalPath: "/docs/allowed.txt", ObjectKey: "objects/a", Size: 4, MD5Status: db.MD5Ready, MD5Digest: "d41d8cd98f00b204e9800998ecf8427e"},
 		{LogicalPath: "/docs/secret.txt", ObjectKey: "objects/b", Size: 6},
 		{LogicalPath: "/docs/.hidden", ObjectKey: "objects/c", Size: 1},
 		{LogicalPath: "/docs/staged.txt", ObjectKey: "staging/partial", Size: 2},
@@ -71,6 +71,40 @@ func TestListFilesRequiresSessionAndFiltersChildren(t *testing.T) {
 	}
 	if response.Path != "/docs" || len(response.Files) != 1 || response.Files[0].Name != "allowed.txt" || response.Files[0].Path != "/docs/allowed.txt" {
 		t.Fatalf("response = %#v", response)
+	}
+	if got := response.Files[0]; got.MD5Status != db.MD5Ready || got.MD5Digest != "d41d8cd98f00b204e9800998ecf8427e" {
+		t.Fatalf("md5 response = %#v", got)
+	}
+}
+
+func TestListFilesNeverExposesMD5ErrorOrInvalidDigest(t *testing.T) {
+	sessions := auth.NewSessionManager(auth.NewMemorySessionStore(), auth.SessionConfig{TTL: time.Hour})
+	defer sessions.Close()
+	repo := listFilesRepo{root: db.StorageRoot{ID: 3, Path: t.TempDir()}, files: []db.File{{LogicalPath: "/docs/bad.txt", ObjectKey: "objects/a", Size: 4, MD5Status: db.MD5Failed, MD5Digest: "not-a-digest", MD5Error: "open /private/objects/a: permission denied"}}}
+	h, err := NewServerWithFiles(config.Default(), rejectingAuthenticator{}, sessions, repo, listAuthorizer{allowed: map[string]bool{"/docs": true, "/docs/bad.txt": true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := sessions.Create(context.Background(), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/roots/3/files?path=docs", nil)
+	req.AddCookie(&http.Cookie{Name: sessions.CookieName(), Value: id})
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if stringContainsAny(rec.Body.String(), "MD5Error", "/private/", "permission denied", "not-a-digest") {
+		t.Fatalf("unsafe MD5 data leaked: %s", rec.Body.String())
+	}
+	var response fileListResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if got := response.Files[0]; got.MD5Status != db.MD5Failed || got.MD5Digest != "" {
+		t.Fatalf("md5 response = %#v", got)
 	}
 }
 

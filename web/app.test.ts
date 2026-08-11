@@ -9,20 +9,18 @@ import {
   DEFAULT_PER_FILE_CONCURRENCY,
   createUploadBatch,
   encodeLogicalPath,
+  filesAPI,
+  formatMD5,
 } from './app.ts';
 
 test('deployment HTML loads the browser-ready JavaScript entrypoint', async () => {
-  const [html, browserEntry, source, embeddedEntry, embeddedHTML] = await Promise.all([
+  const [html, browserEntry, source] = await Promise.all([
     readFile(new URL('./index.html', import.meta.url), 'utf8'),
     readFile(new URL('./app.js', import.meta.url), 'utf8'),
     readFile(new URL('./app.ts', import.meta.url), 'utf8'),
-    readFile(new URL('../internal/httpapi/assets/app.js', import.meta.url), 'utf8'),
-    readFile(new URL('../internal/httpapi/assets/index.html', import.meta.url), 'utf8'),
   ]);
   assert.match(html, /<script type="module" src="\.\/app\.js"><\/script>/);
   assert.equal(browserEntry, source);
-  assert.equal(embeddedEntry, browserEntry);
-  assert.equal(embeddedHTML, html);
 });
 
 function file(name, body, relative = '') {
@@ -166,4 +164,44 @@ test('retry shares the bounded pool and reports lifecycle progress', async () =>
   assert.equal(batch.items[0].status, 'completed');
   assert.ok(events.some(([, status]) => status === 'failed'));
   assert.ok(events.some(([, status, progress]) => status === 'uploading' && progress > 0));
+});
+
+test('file API and MD5 formatter show only enabled safe digests', async () => {
+  const calls = [];
+  const api = filesAPI(async (url, init) => { calls.push({ url, init }); return { ok: true, json: async () => ({ files: [] }) }; });
+  await api.list(3, '/docs');
+  assert.equal(calls[0].url, '/roots/3/files?path=/docs');
+  assert.equal(calls[0].init.credentials, 'same-origin');
+  assert.equal(formatMD5({ md5_status: 'ready', md5_digest: 'd41d8cd98f00b204e9800998ecf8427e' }, true), 'MD5: d41d8cd98f00b204e9800998ecf8427e');
+  assert.equal(formatMD5({ md5_status: 'ready', md5_digest: 'unsafe' }, true), 'MD5: unavailable');
+  assert.equal(formatMD5({ md5_status: 'ready', md5_digest: 'd41d8cd98f00b204e9800998ecf8427e' }, false), '');
+});
+
+test('site settings API saves settings and uses the dedicated asset upload and reset endpoints', async () => {
+  const requests = [];
+  const api = (await import('./app.ts')).siteSettingsAPI(async (url, init = {}) => {
+    requests.push({ url, init });
+    if (init.method === 'POST') return new Response(JSON.stringify({ url: '/assets/site/7' }), { status: 201 });
+    return new Response(init.method === 'GET' ? JSON.stringify({ site_name: 'Example' }) : null, { status: 204 });
+  });
+  await api.save({ site_name: 'Example', primary_color: '#123abc', filing_enabled: false, filing_text: '', md5_enabled: true });
+  await api.uploadAsset('login_logo', new Blob(['image'], { type: 'image/png' }));
+  await api.resetAsset('login_logo');
+  assert.equal(requests[0].url, '/api/admin/site-settings');
+  assert.equal(requests[0].init.method, 'PUT');
+  assert.equal(requests[1].url, '/api/admin/site-settings/assets/login_logo');
+  assert.equal(requests[1].init.method, 'POST');
+  assert.equal(requests[1].init.headers['Content-Type'], 'image/png');
+  assert.equal(requests[2].url, '/api/admin/site-settings/assets/login_logo');
+  assert.equal(requests[2].init.method, 'DELETE');
+});
+
+test('deployment HTML exposes dynamic branding controls and all three asset reset buttons', async () => {
+  const html = await readFile(new URL('./index.html', import.meta.url), 'utf8');
+  assert.match(html, /id="site-favicon"/);
+  assert.match(html, /id="login-logo"/);
+  assert.match(html, /id="nav-logo"/);
+  assert.match(html, /data-asset-reset="login_logo"/);
+  assert.match(html, /data-asset-reset="nav_logo"/);
+  assert.match(html, /data-asset-reset="favicon"/);
 });

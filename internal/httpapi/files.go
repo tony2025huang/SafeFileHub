@@ -27,9 +27,11 @@ type fileListResponse struct {
 	Files []fileListEntry `json:"files"`
 }
 type fileListEntry struct {
-	Name string `json:"name"`
-	Path string `json:"path"`
-	Size int64  `json:"size"`
+	Name      string `json:"name"`
+	Path      string `json:"path"`
+	Size      int64  `json:"size"`
+	MD5Status string `json:"md5_status"`
+	MD5Digest string `json:"md5_digest"`
 }
 
 // NewServerWithFiles adds the Task 5 authenticated logical directory listing.
@@ -101,12 +103,35 @@ func listFiles(repository fileRepository, authorizer fileAuthorizer, policy conf
 			if err != nil || !allowed {
 				continue
 			}
-			response.Files = append(response.Files, fileListEntry{Name: strings.TrimPrefix(file.LogicalPath, path.Canonical+"/"), Path: file.LogicalPath, Size: file.Size})
+			response.Files = append(response.Files, fileListEntry{Name: strings.TrimPrefix(file.LogicalPath, path.Canonical+"/"), Path: file.LogicalPath, Size: file.Size, MD5Status: publicMD5Status(file.MD5Status), MD5Digest: publicMD5Digest(file.MD5Status, file.MD5Digest)})
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(response)
 	}
 }
+
+// publicMD5Status and publicMD5Digest deliberately omit MD5Error: repository
+// errors may contain object keys or host paths and are never API data.
+func publicMD5Status(status string) string {
+	switch status {
+	case db.MD5Disabled, db.MD5Pending, db.MD5Computing, db.MD5Ready, db.MD5Failed:
+		return status
+	default:
+		return db.MD5Disabled
+	}
+}
+func publicMD5Digest(status, digest string) string {
+	if status != db.MD5Ready || len(digest) != 32 {
+		return ""
+	}
+	for _, c := range digest {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return ""
+		}
+	}
+	return digest
+}
+
 func logicalCanonical(value string, policy config.NamePolicy) (string, error) {
 	if value == "/" {
 		return "/", nil

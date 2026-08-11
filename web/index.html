@@ -4,10 +4,32 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SafeFileHub transfers</title>
+  <link id="site-favicon" rel="icon" href="/favicon.ico">
+  <style>
+    :root { --primary-color: #2563eb; color-scheme: light; font-family: system-ui, sans-serif; }
+    body { margin: 0; color: #172033; background: #f7f8fb; }
+    main { max-width: 48rem; margin: 2rem auto; padding: 0 1rem; }
+    .brand { display: flex; align-items: center; gap: .75rem; }
+    .brand img { max-width: 10rem; max-height: 3rem; object-fit: contain; }
+    form { display: grid; gap: .75rem; padding: 1rem; background: white; border-radius: .5rem; }
+    label { display: grid; gap: .25rem; }
+    input, button { font: inherit; padding: .45rem; }
+    button { color: white; border: 0; border-radius: .25rem; background: var(--primary-color); cursor: pointer; }
+    button[type="button"] { margin-left: .25rem; }
+    #admin-settings { margin-top: 2rem; }
+    #admin-settings h2 { margin-bottom: .5rem; }
+    .asset-row { display: grid; grid-template-columns: 1fr auto; gap: .5rem; align-items: end; }
+    footer { margin-top: 2rem; color: #5f6675; font-size: .875rem; }
+  </style>
 </head>
 <body>
   <main>
-    <h1>Upload files or a directory</h1>
+    <header class="brand">
+      <img id="nav-logo" hidden alt="">
+      <div><strong data-site-name>SafeFileHub</strong></div>
+    </header>
+    <img id="login-logo" hidden alt="">
+    <h1>Upload files to <span data-site-name>SafeFileHub</span></h1>
     <form id="upload-form">
       <label>Storage root ID <input id="root-id" type="number" min="1" required></label>
       <label>Destination directory <input id="directory" value="/" required></label>
@@ -16,6 +38,29 @@
     </form>
     <p id="summary" aria-live="polite"></p>
     <ul id="uploads" aria-live="polite"></ul>
+    <section aria-labelledby="files-title">
+      <h2 id="files-title">Files</h2>
+      <button id="refresh-files" type="button">Refresh file list</button>
+      <p id="files-status" aria-live="polite"></p>
+      <ul id="file-list" aria-live="polite"></ul>
+    </section>
+
+    <section id="admin-settings" hidden aria-labelledby="admin-settings-title">
+      <h2 id="admin-settings-title">Site settings</h2>
+      <form id="admin-settings-form">
+        <label>Site name <input name="site_name" required maxlength="120"></label>
+        <label>Primary color <input name="primary_color" type="color" value="#2563eb" required></label>
+        <label><input name="filing_enabled" type="checkbox"> Show filing text</label>
+        <label>Filing text <input name="filing_text" maxlength="240"></label>
+        <label><input name="md5_enabled" type="checkbox"> Enable MD5 display</label>
+        <div class="asset-row"><label>Login logo <input data-asset-upload="login_logo" type="file" accept="image/png,image/jpeg,image/gif"></label><button data-asset-reset="login_logo" type="button">Reset login logo</button></div>
+        <div class="asset-row"><label>Navigation logo <input data-asset-upload="nav_logo" type="file" accept="image/png,image/jpeg,image/gif"></label><button data-asset-reset="nav_logo" type="button">Reset navigation logo</button></div>
+        <div class="asset-row"><label>Favicon <input data-asset-upload="favicon" type="file" accept="image/png,image/x-icon,image/vnd.microsoft.icon"></label><button data-asset-reset="favicon" type="button">Reset favicon</button></div>
+        <button type="submit">Save settings</button>
+      </form>
+      <p id="admin-settings-status" aria-live="polite"></p>
+    </section>
+    <footer><span id="filing" hidden></span></footer>
   </main>
   <script type="module" src="./app.js"></script>
 </body>

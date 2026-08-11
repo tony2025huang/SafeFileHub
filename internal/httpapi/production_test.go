@@ -59,12 +59,24 @@ func TestNewProductionServerRouteContract(t *testing.T) {
 		{"POST", "/login"}, {"POST", "/logout"}, {"GET", "/session"},
 		{"GET", "/roots/1/files"}, {"POST", "/api/uploads"}, {"HEAD", "/api/uploads/x"}, {"PATCH", "/api/uploads/x"}, {"DELETE", "/api/uploads/x"}, {"POST", "/api/uploads/x/complete"},
 		{"GET", "/api/files/1"}, {"POST", "/api/files"}, {"POST", "/api/roots/1/archives"}, {"GET", "/api/archives/x"}, {"DELETE", "/api/archives/x"}, {"GET", "/api/admin/audit"},
+		{"GET", "/api/site-settings"},
+		{"GET", "/api/admin/site-settings"}, {"PUT", "/api/admin/site-settings"}, {"POST", "/api/admin/site-settings/assets/favicon"}, {"DELETE", "/api/admin/site-settings/assets/favicon"},
 	} {
 		r := httptest.NewRequest(route.method, route.path, nil)
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, r)
 		if w.Code == http.StatusNotFound || w.Code == http.StatusMethodNotAllowed {
 			t.Errorf("%s %s is not registered: %d", route.method, route.path, w.Code)
+		}
+	}
+	// These routes legitimately return 404 when no branding asset is configured;
+	// a method mismatch proves their GET-only public contracts are installed.
+	for _, path := range []string{"/assets/site/1", "/favicon.ico"} {
+		r := httptest.NewRequest(http.MethodPut, path, nil)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Errorf("GET %s route contract missing: %d", path, w.Code)
 		}
 	}
 }
