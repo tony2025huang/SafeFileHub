@@ -78,12 +78,12 @@ func TestAuthenticateRejectsDisabledUser(t *testing.T) {
 	}
 }
 
-func TestSessionCookieIsSecureAsConfiguredAndExpires(t *testing.T) {
+func TestSessionCookieDefaultsToSecureAndExpires(t *testing.T) {
 	t.Parallel()
 	store := auth.NewMemorySessionStore()
 	now := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
 	manager := auth.NewSessionManager(store, auth.SessionConfig{
-		CookieName: "safefilehub_session", TTL: time.Hour, Secure: true, Now: func() time.Time { return now },
+		CookieName: "safefilehub_session", TTL: time.Hour, Now: func() time.Time { return now },
 	})
 	id, err := manager.Create(context.Background(), 42)
 	if err != nil {
@@ -96,11 +96,11 @@ func TestSessionCookieIsSecureAsConfiguredAndExpires(t *testing.T) {
 	rr := httptest.NewRecorder()
 	manager.SetCookie(rr, id)
 	cookie := rr.Result().Cookies()[0]
-	if !cookie.Secure || !cookie.HttpOnly || cookie.SameSite != http.SameSiteLaxMode || cookie.Value != id || !cookie.Expires.Equal(now.Add(time.Hour)) {
+	if !cookie.Secure || !cookie.HttpOnly || cookie.SameSite != http.SameSiteLaxMode || cookie.Value != id || !cookie.Expires.Equal(now.Add(time.Hour)) || cookie.MaxAge != int(time.Hour.Seconds()) {
 		t.Fatalf("session cookie = %#v", cookie)
 	}
-	if strings.Contains(cookie.Value, "42") {
-		t.Fatalf("cookie leaks user data: %q", cookie.Value)
+	if cookie.Value == "42" {
+		t.Fatalf("cookie exposes the user ID: %q", cookie.Value)
 	}
 	if _, err := manager.UserID(context.Background(), id); err != nil {
 		t.Fatalf("read fresh session: %v", err)
@@ -227,7 +227,7 @@ func TestLogoutRevokesSessionAndClearsMatchingCookie(t *testing.T) {
 	now := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
 	store := auth.NewMemorySessionStore()
 	manager := auth.NewSessionManager(store, auth.SessionConfig{
-		CookieName: "custom_session", TTL: time.Hour, Secure: true, SameSite: http.SameSiteStrictMode, Now: func() time.Time { return now },
+		CookieName: "custom_session", TTL: time.Hour, SameSite: http.SameSiteStrictMode, Now: func() time.Time { return now },
 	})
 	id, err := manager.Create(context.Background(), 42)
 	if err != nil {
@@ -261,6 +261,9 @@ func TestSessionManagerCloseCancelsBlockedGCAndPreventsRestart(t *testing.T) {
 	}
 	manager.Close()
 	manager.Close() // Close is safe to call repeatedly during layered shutdown.
+	if manager.ShutdownTimedOut() {
+		t.Fatal("ShutdownTimedOut = true for a context-aware store")
+	}
 	select {
 	case <-store.exited:
 	case <-time.After(time.Second):
@@ -294,14 +297,60 @@ func (s *contextBlockingSessionStore) DeleteExpired(ctx context.Context, _ time.
 	return 0, ctx.Err()
 }
 
-func TestSessionCookieCanDisableSecureFlag(t *testing.T) {
+func TestSessionCookieCanExplicitlyDisableSecureFlagForLocalDevelopment(t *testing.T) {
 	t.Parallel()
-	manager := auth.NewSessionManager(auth.NewMemorySessionStore(), auth.SessionConfig{TTL: time.Hour, Secure: false})
+	manager := auth.NewSessionManager(auth.NewMemorySessionStore(), auth.SessionConfig{TTL: time.Hour, InsecureCookie: true})
 	rr := httptest.NewRecorder()
 	manager.SetCookie(rr, "random-server-side-id")
 	if cookie := rr.Result().Cookies()[0]; cookie.Secure {
 		t.Fatal("cookie Secure = true, want false")
 	}
+}
+
+func TestSessionManagerCloseReturnsWithinBudgetForUncooperativeStore(t *testing.T) {
+	store := &uncooperativeSessionStore{
+		SessionStore: auth.NewMemorySessionStore(),
+		entered:      make(chan struct{}, 1),
+		block:        make(chan struct{}),
+	}
+	manager := auth.NewSessionManager(store, auth.SessionConfig{
+		TTL:                 time.Hour,
+		GCDeleteTimeout:     time.Hour,
+		ShutdownWaitTimeout: 20 * time.Millisecond,
+	})
+	if _, err := manager.Create(context.Background(), 1); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	select {
+	case <-store.entered:
+	case <-time.After(time.Second):
+		t.Fatal("GC did not enter DeleteExpired")
+	}
+
+	start := time.Now()
+	manager.Close()
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("Close took %s; want bounded shutdown", elapsed)
+	}
+	if !manager.ShutdownTimedOut() {
+		t.Fatal("ShutdownTimedOut = false, want true")
+	}
+	close(store.block)
+}
+
+type uncooperativeSessionStore struct {
+	auth.SessionStore
+	entered chan struct{}
+	block   chan struct{}
+}
+
+func (s *uncooperativeSessionStore) DeleteExpired(context.Context, time.Time, int) (int, error) {
+	select {
+	case s.entered <- struct{}{}:
+	default:
+	}
+	<-s.block
+	return 0, nil
 }
 
 func testRepository(t *testing.T) *db.Repository {
@@ -319,7 +368,6 @@ func TestSessionCookieUsesConfiguredSameSiteAndExpiresWithTTL(t *testing.T) {
 	now := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
 	manager := auth.NewSessionManager(auth.NewMemorySessionStore(), auth.SessionConfig{
 		TTL:      90 * time.Minute,
-		Secure:   true,
 		SameSite: http.SameSiteStrictMode,
 		Now:      func() time.Time { return now },
 	})

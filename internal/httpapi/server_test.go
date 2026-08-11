@@ -38,7 +38,7 @@ func TestAuthenticationLoginLogoutAndProtectedEndpoint(t *testing.T) {
 		t.Fatalf("POST /login = %d, body %q", login.Code, login.Body.String())
 	}
 	cookie := login.Result().Cookies()[0]
-	if !cookie.HttpOnly || cookie.Value == "" {
+	if !cookie.Secure || !cookie.HttpOnly || cookie.SameSite != http.SameSiteLaxMode || cookie.Value == "" || cookie.Expires.IsZero() || cookie.MaxAge != int(time.Hour.Seconds()) {
 		t.Fatalf("login cookie = %#v", cookie)
 	}
 

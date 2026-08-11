@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/example/safefilehub/internal/db"
@@ -31,29 +32,35 @@ type SessionStore interface {
 	DeleteExpired(context.Context, time.Time, int) (int, error)
 }
 type SessionConfig struct {
-	CookieName       string
-	TTL              time.Duration
-	Secure           bool
+	CookieName string
+	TTL        time.Duration
+	// InsecureCookie explicitly permits a non-Secure cookie for local HTTP development.
+	// Production defaults are always Secure.
+	InsecureCookie   bool
 	SameSite         http.SameSite
 	Now              func() time.Time
 	LifecycleContext context.Context
 	GCDeleteTimeout  time.Duration
+	// ShutdownWaitTimeout bounds how long Close waits for the managed GC worker.
+	ShutdownWaitTimeout time.Duration
 }
 
 const sessionGCMaxDeletes = 64
 const defaultGCDeleteTimeout = 5 * time.Second
+const defaultShutdownWaitTimeout = 5 * time.Second
 
 type SessionManager struct {
 	store  SessionStore
 	config SessionConfig
 
-	lifecycleCtx    context.Context
-	cancelLifecycle context.CancelFunc
-	closeOnce       sync.Once
-	gcMu            sync.Mutex
-	gcRunning       bool
-	closed          bool
-	gcWG            sync.WaitGroup
+	lifecycleCtx     context.Context
+	cancelLifecycle  context.CancelFunc
+	closeOnce        sync.Once
+	gcMu             sync.Mutex
+	gcRunning        bool
+	closed           bool
+	gcDone           chan struct{}
+	shutdownTimedOut atomic.Bool
 }
 
 func NewSessionManager(store SessionStore, config SessionConfig) *SessionManager {
@@ -72,11 +79,16 @@ func NewSessionManager(store SessionStore, config SessionConfig) *SessionManager
 	if config.GCDeleteTimeout <= 0 {
 		config.GCDeleteTimeout = defaultGCDeleteTimeout
 	}
+	if config.ShutdownWaitTimeout <= 0 {
+		config.ShutdownWaitTimeout = defaultShutdownWaitTimeout
+	}
 	if config.LifecycleContext == nil {
 		config.LifecycleContext = context.Background()
 	}
 	lifecycleCtx, cancelLifecycle := context.WithCancel(config.LifecycleContext)
-	return &SessionManager{store: store, config: config, lifecycleCtx: lifecycleCtx, cancelLifecycle: cancelLifecycle}
+	done := make(chan struct{})
+	close(done)
+	return &SessionManager{store: store, config: config, lifecycleCtx: lifecycleCtx, cancelLifecycle: cancelLifecycle, gcDone: done}
 }
 func (m *SessionManager) Create(ctx context.Context, userID int64) (string, error) {
 	// Maintenance must never delay authentication. A single background worker
@@ -133,19 +145,20 @@ func (m *SessionManager) scheduleGC(now time.Time) {
 		return
 	}
 	m.gcRunning = true
-	m.gcWG.Add(1)
-	go m.runGC(now)
+	done := make(chan struct{})
+	m.gcDone = done
+	go m.runGC(now, done)
 }
 
 // runGC is the only automatic GC worker. Each pass is bounded, and the
 // worker exits as soon as a pass is not full. This both eventually drains a
 // backlog and prevents concurrent Create calls from multiplying GC work.
-func (m *SessionManager) runGC(now time.Time) {
+func (m *SessionManager) runGC(now time.Time, done chan struct{}) {
 	defer func() {
 		m.gcMu.Lock()
 		m.gcRunning = false
 		m.gcMu.Unlock()
-		m.gcWG.Done()
+		close(done)
 	}()
 	for {
 		ctx, cancel := context.WithTimeout(m.lifecycleCtx, m.config.GCDeleteTimeout)
@@ -166,24 +179,37 @@ func (m *SessionManager) runGC(now time.Time) {
 }
 
 // Close stops the background GC worker and prevents future workers from starting.
+// Stores must honor their context for a fully graceful shutdown. A faulty store
+// cannot prevent process shutdown: the one managed GC worker is given a bounded
+// grace period, after which the timeout is recorded and Close returns.
 func (m *SessionManager) Close() {
 	m.closeOnce.Do(func() {
 		m.gcMu.Lock()
 		m.closed = true
+		done := m.gcDone
 		m.gcMu.Unlock()
 		m.cancelLifecycle()
-		m.gcWG.Wait()
+		select {
+		case <-done:
+		case <-time.After(m.config.ShutdownWaitTimeout):
+			m.shutdownTimedOut.Store(true)
+			log.Printf("auth: session GC worker did not stop within %s", m.config.ShutdownWaitTimeout)
+		}
 	})
 }
 
+// ShutdownTimedOut reports whether Close had to abandon its bounded wait for
+// the managed GC worker because a SessionStore ignored cancellation.
+func (m *SessionManager) ShutdownTimedOut() bool { return m.shutdownTimedOut.Load() }
+
 func (m *SessionManager) SetCookie(w http.ResponseWriter, id string) {
 	now := m.config.Now().UTC()
-	http.SetCookie(w, &http.Cookie{Name: m.config.CookieName, Value: id, Path: "/", Expires: now.Add(m.config.TTL), MaxAge: int(m.config.TTL.Seconds()), Secure: m.config.Secure, HttpOnly: true, SameSite: m.config.SameSite})
+	http.SetCookie(w, &http.Cookie{Name: m.config.CookieName, Value: id, Path: "/", Expires: now.Add(m.config.TTL), MaxAge: int(m.config.TTL.Seconds()), Secure: !m.config.InsecureCookie, HttpOnly: true, SameSite: m.config.SameSite})
 }
 
 // ClearSessionCookie invalidates the client cookie using the same security attributes.
 func (m *SessionManager) ClearSessionCookie(w http.ResponseWriter) {
-	http.SetCookie(w, &http.Cookie{Name: m.config.CookieName, Value: "", Path: "/", Expires: m.config.Now().UTC().Add(-time.Second), MaxAge: -1, Secure: m.config.Secure, HttpOnly: true, SameSite: m.config.SameSite})
+	http.SetCookie(w, &http.Cookie{Name: m.config.CookieName, Value: "", Path: "/", Expires: m.config.Now().UTC().Add(-time.Second), MaxAge: -1, Secure: !m.config.InsecureCookie, HttpOnly: true, SameSite: m.config.SameSite})
 }
 
 func (m *SessionManager) CookieName() string { return m.config.CookieName }
