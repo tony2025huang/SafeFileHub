@@ -1,0 +1,27 @@
+# Copy to /etc/systemd/system/safefilehub.service after setting paths/user.
+# Keep data and staging on the same filesystem if atomic upload publication is required.
+[Unit]
+Description=SafeFileHub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=safefilehub
+Group=safefilehub
+WorkingDirectory=/var/lib/safefilehub
+ExecStart=/usr/local/bin/safefilehub -recover-on-start=true
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/safefilehub/data /var/lib/safefilehub/staging
+LimitNOFILE=65536
+UMask=0077
+# Supply application configuration using the approved deployment mechanism;
+# never place passwords or session material in this unit.
+
+[Install]
+WantedBy=multi-user.target

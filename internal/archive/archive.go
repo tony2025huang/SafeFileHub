@@ -47,7 +47,9 @@ type Options struct {
 	TempDir           string
 }
 type Job struct {
-	ID                   string
+	ID string
+	// UserID privately binds the temporary artifact to its creator.
+	UserID               int64
 	Status               Status
 	CreatedAt, ExpiresAt time.Time
 	Size                 int64
@@ -114,6 +116,18 @@ func (m *Manager) Close() {
 	})
 }
 func (m *Manager) Create(ctx context.Context, root string, entries []Entry, authorizer Authorizer) (Job, error) {
+	return m.create(ctx, 0, root, entries, authorizer)
+}
+
+// CreateForUser creates an archive private to userID. HTTP callers must use it.
+func (m *Manager) CreateForUser(ctx context.Context, userID int64, root string, entries []Entry, authorizer Authorizer) (Job, error) {
+	if userID <= 0 {
+		return Job{}, errors.New("archive owner is required")
+	}
+	return m.create(ctx, userID, root, entries, authorizer)
+}
+
+func (m *Manager) create(ctx context.Context, userID int64, root string, entries []Entry, authorizer Authorizer) (Job, error) {
 	if authorizer == nil {
 		return Job{}, errors.New("archive authorizer is required")
 	}
@@ -135,7 +149,7 @@ func (m *Manager) Create(ctx context.Context, root string, entries []Entry, auth
 	}
 	now := time.Now().UTC()
 	jobctx, cancel := context.WithCancel(context.Background())
-	j := &managedJob{Job: Job{ID: id, Status: Running, CreatedAt: now, ExpiresAt: now.Add(m.options.TTL)}, cancel: cancel}
+	j := &managedJob{Job: Job{ID: id, UserID: userID, Status: Running, CreatedAt: now, ExpiresAt: now.Add(m.options.TTL)}, cancel: cancel}
 	m.mu.Lock()
 	select {
 	case <-m.closed:
@@ -157,6 +171,15 @@ func (m *Manager) Create(ctx context.Context, root string, entries []Entry, auth
 		return Job{}, errors.New("archive manager closed")
 	}
 }
+
+// OwnedBy is a boolean-only private-artifact access check.
+func (m *Manager) OwnedBy(id string, userID int64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j := m.jobs[id]
+	return j != nil && j.UserID == userID && userID > 0
+}
+
 func (m *Manager) worker() {
 	defer m.wg.Done()
 	for {

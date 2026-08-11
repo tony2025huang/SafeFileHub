@@ -111,7 +111,7 @@ func createArchive(repo archiveRepository, auth archiveAuthorizer, manager *arch
 				entries = append(entries, archive.Entry{LogicalPath: f.LogicalPath, ObjectKey: f.ObjectKey, Size: f.Size})
 			}
 		}
-		job, err := manager.Create(r.Context(), p.Canonical, entries, archiveHTTPAuthorizer{ctx: r.Context(), auth: auth, uid: uid, rootID: rootID})
+		job, err := manager.CreateForUser(r.Context(), uid, p.Canonical, entries, archiveHTTPAuthorizer{ctx: r.Context(), auth: auth, uid: uid, rootID: rootID})
 		if errors.Is(err, archive.ErrForbidden) {
 			http.Error(w, "forbidden", 403)
 			return
@@ -139,6 +139,11 @@ func (a archiveHTTPAuthorizer) Allow(_ context.Context, p string) (bool, error) 
 }
 func downloadArchive(manager *archive.Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		uid, _ := r.Context().Value(sessionUserIDKey{}).(int64)
+		if !manager.OwnedBy(r.PathValue("jobID"), uid) {
+			http.NotFound(w, r)
+			return
+		}
 		j, err := manager.Job(r.PathValue("jobID"))
 		if err != nil {
 			http.NotFound(w, r)
@@ -167,6 +172,11 @@ func downloadArchive(manager *archive.Manager) http.HandlerFunc {
 }
 func cancelArchive(manager *archive.Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		uid, _ := r.Context().Value(sessionUserIDKey{}).(int64)
+		if !manager.OwnedBy(r.PathValue("jobID"), uid) {
+			http.NotFound(w, r)
+			return
+		}
 		if err := manager.Cancel(r.PathValue("jobID")); err != nil {
 			http.NotFound(w, r)
 			return
