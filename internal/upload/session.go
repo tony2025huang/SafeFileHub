@@ -4,6 +4,7 @@ package upload
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -17,6 +18,8 @@ import (
 
 var ErrOffset = errors.New("upload offset conflict")
 var ErrTooLarge = errors.New("upload exceeds declared length")
+var ErrIncomplete = errors.New("upload is incomplete")
+var ErrChecksum = errors.New("upload checksum mismatch")
 
 type Session struct {
 	ID             string
@@ -29,6 +32,7 @@ type repository interface {
 	UpdateUploadOffset(context.Context, string, int64, int64) error
 	UpdateUploadStatus(context.Context, string, string, string) error
 	DeleteUploadSession(context.Context, string) error
+	CompleteUpload(context.Context, db.File, string) error
 }
 type Manager struct {
 	repo  repository
@@ -152,6 +156,53 @@ func (m *Manager) Write(ctx context.Context, id string, offset int64, body io.Re
 	})
 	return next, err
 }
+
+// Complete validates the immutable staged inode, publishes it atomically, then
+// commits metadata and session deletion in one short compare-and-swap DB transaction.
+func (m *Manager) Complete(ctx context.Context, id, expectedSHA256 string) error {
+	return m.withLifecycleLock(ctx, id, func(s db.UploadSession) error {
+		if s.Status != "active" || !s.ExpiresAt.After(time.Now()) {
+			return db.ErrNotFound
+		}
+		if s.Offset != s.Length {
+			return ErrIncomplete
+		}
+		n, sum, err := m.store.HashAndSyncStaging(s.StagingPath)
+		if err != nil {
+			return err
+		}
+		if n != s.Length {
+			return ErrIncomplete
+		}
+		if expectedSHA256 != "" {
+			want, err := hex.DecodeString(expectedSHA256)
+			if err != nil || len(want) != sha256.Size || !equalHash(sum[:], want) {
+				return ErrChecksum
+			}
+		}
+		key, err := m.store.PublishStaging(s.StagingPath)
+		if err != nil {
+			return err
+		}
+		// Publish precedes metadata. If the DB commit fails, the object is an
+		// unreachable orphan; never a listing-visible half completion.
+		if err := m.repo.CompleteUpload(ctx, db.File{RootID: s.RootID, LogicalPath: s.LogicalPath, ObjectKey: key, Size: s.Length, CreatedByUserID: s.UserID}, s.ID); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+func equalHash(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	var v byte
+	for i := range a {
+		v |= a[i] ^ b[i]
+	}
+	return v == 0
+}
+
 func (m *Manager) Cancel(ctx context.Context, id string) error { return m.cleanup(ctx, id, false) }
 func (m *Manager) cleanup(ctx context.Context, id string, expiryOnly bool) error {
 	return m.withLifecycleLock(ctx, id, func(s db.UploadSession) error {
