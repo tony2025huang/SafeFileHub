@@ -76,6 +76,7 @@ type AuditEvent struct {
 	Action      string
 	LogicalPath string
 	Detail      string
+	Status      int
 	CreatedAt   time.Time
 }
 
@@ -406,12 +407,16 @@ func (r *Repository) DeleteUploadSession(ctx context.Context, id string) error {
 }
 
 func (r *Repository) CreateAuditEvent(ctx context.Context, event AuditEvent) (AuditEvent, error) {
+	event.Detail = redactAuditDetail(event.Detail)
+	if event.Status == 0 {
+		event.Status = auditStatus(event.Detail)
+	}
 	createdAt := utcOrNow(event.CreatedAt)
 	var rootID any = event.RootID
 	if event.RootID == 0 {
 		rootID = nil
 	}
-	result, err := r.db.ExecContext(ctx, `INSERT INTO audit_events (user_id, root_id, action, logical_path, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)`, event.UserID, rootID, event.Action, event.LogicalPath, event.Detail, unixNano(createdAt))
+	result, err := r.db.ExecContext(ctx, `INSERT INTO audit_events (user_id, root_id, action, logical_path, detail, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, event.UserID, rootID, event.Action, event.LogicalPath, event.Detail, event.Status, unixNano(createdAt))
 	if err != nil {
 		return AuditEvent{}, classifyError(err)
 	}
@@ -423,8 +428,50 @@ func (r *Repository) CreateAuditEvent(ctx context.Context, event AuditEvent) (Au
 	return event, nil
 }
 
+// redactAuditDetail preserves only non-sensitive operational metadata. Audit
+// records never retain supplied credentials, request content, or tokens.
+func redactAuditDetail(detail string) string {
+	fields := strings.Fields(detail)
+	kept := make([]string, 0, len(fields))
+	for _, field := range fields {
+		lower := strings.ToLower(field)
+		if strings.HasPrefix(lower, "password=") || strings.HasPrefix(lower, "content=") || strings.HasPrefix(lower, "token=") || strings.HasPrefix(lower, "secret=") || strings.HasPrefix(lower, "authorization=") {
+			continue
+		}
+		if strings.HasPrefix(lower, "status=") || strings.HasPrefix(lower, "target_user_id=") {
+			kept = append(kept, field)
+		}
+	}
+	return strings.Join(kept, " ")
+}
+
+func auditStatus(detail string) int {
+	for _, field := range strings.Fields(detail) {
+		if strings.HasPrefix(strings.ToLower(field), "status=") {
+			var status int
+			if _, err := fmt.Sscanf(field, "status=%d", &status); err == nil {
+				return status
+			}
+		}
+	}
+	return 0
+}
+
 func (r *Repository) AuditEventsForUser(ctx context.Context, userID int64) ([]AuditEvent, error) {
-	rows, err := r.db.QueryContext(ctx, `SELECT id, user_id, root_id, action, logical_path, detail, created_at FROM audit_events WHERE user_id = ? ORDER BY id`, userID)
+	return r.auditEvents(ctx, `SELECT id, user_id, root_id, action, logical_path, detail, status, created_at FROM audit_events WHERE user_id = ? ORDER BY id`, userID)
+}
+
+// AuditEvents returns a bounded audit history for authorized administrative
+// visibility. Callers must enforce administration authorization before use.
+func (r *Repository) AuditEvents(ctx context.Context, limit int) ([]AuditEvent, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	return r.auditEvents(ctx, `SELECT id, user_id, root_id, action, logical_path, detail, status, created_at FROM audit_events ORDER BY id DESC LIMIT ?`, limit)
+}
+
+func (r *Repository) auditEvents(ctx context.Context, query string, args ...any) ([]AuditEvent, error) {
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query audit events: %w", err)
 	}
@@ -434,7 +481,7 @@ func (r *Repository) AuditEventsForUser(ctx context.Context, userID int64) ([]Au
 		var event AuditEvent
 		var rootID sql.NullInt64
 		var createdAt int64
-		if err := rows.Scan(&event.ID, &event.UserID, &rootID, &event.Action, &event.LogicalPath, &event.Detail, &createdAt); err != nil {
+		if err := rows.Scan(&event.ID, &event.UserID, &rootID, &event.Action, &event.LogicalPath, &event.Detail, &event.Status, &createdAt); err != nil {
 			return nil, fmt.Errorf("scan audit event: %w", err)
 		}
 		event.RootID = rootID.Int64

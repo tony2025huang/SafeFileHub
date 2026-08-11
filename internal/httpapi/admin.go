@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/example/safefilehub/internal/auth"
 	"github.com/example/safefilehub/internal/config"
@@ -51,6 +52,7 @@ func registerAdminRoutes(mux *http.ServeMux, cfg config.Config, sessions userSes
 	mux.Handle("PUT /api/admin/users/{userID}/disabled", guard(http.HandlerFunc(setUserDisabled(repository, sessions))))
 	mux.Handle("PUT /api/admin/users/{userID}/password", guard(http.HandlerFunc(resetUserPassword(repository, sessions))))
 	mux.Handle("PUT /api/admin/users/{userID}/permissions", guard(http.HandlerFunc(setUserPermission(cfg.NamePolicy, repository))))
+	mux.Handle("GET /api/admin/audit", guard(http.HandlerFunc(listAuditEvents(repository))))
 }
 
 func requireAdmin(cfg config.Config, repo adminRepository, next http.Handler) http.Handler {
@@ -66,6 +68,14 @@ func adminActor(r *http.Request) int64 { id, _ := r.Context().Value(sessionUserI
 func adminTargetID(r *http.Request) (int64, error) { id, err := strconv.ParseInt(r.PathValue("userID"), 10, 64); if err != nil || id <= 0 { return 0, errors.New("invalid user") }; return id, nil }
 func decodeAdminJSON(w http.ResponseWriter, r *http.Request, value any) error { d := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)); d.DisallowUnknownFields(); return d.Decode(value) }
 func auditAdmin(ctx context.Context, repo adminRepository, actor, target int64, action, path string) error { _, err := repo.CreateAuditEvent(ctx, db.AuditEvent{UserID: actor, Action: action, LogicalPath: path, Detail: "target_user_id=" + strconv.FormatInt(target, 10)}); return err }
+type auditResponse struct { Actor int64 `json:"actor"`; Action string `json:"action"`; Path string `json:"path"`; Status int `json:"status"`; CreatedAt string `json:"created_at"` }
+func listAuditEvents(repo adminRepository) http.HandlerFunc { return func(w http.ResponseWriter, r *http.Request) {
+	auditRepo, ok := repo.(interface { AuditEvents(context.Context, int) ([]db.AuditEvent, error) }); if !ok { http.Error(w,"audit unavailable",http.StatusServiceUnavailable); return }
+	limit:=100; if raw:=r.URL.Query().Get("limit"); raw!="" { n,err:=strconv.Atoi(raw); if err!=nil || n<1 || n>100 { http.Error(w,"invalid limit",400); return }; limit=n }
+	events,err:=auditRepo.AuditEvents(r.Context(),limit); if err!=nil { http.Error(w,"audit",500); return }
+	result:=make([]auditResponse,0,len(events)); for _, event:=range events { result=append(result,auditResponse{Actor:event.UserID,Action:event.Action,Path:event.LogicalPath,Status:event.Status,CreatedAt:event.CreatedAt.UTC().Format(time.RFC3339Nano)}) }
+	w.Header().Set("Content-Type","application/json; charset=utf-8"); _=json.NewEncoder(w).Encode(result)
+} }
 
 func createAdminUser(repo adminRepository) http.HandlerFunc { return func(w http.ResponseWriter, r *http.Request) {
 	var in createAdminUserRequest

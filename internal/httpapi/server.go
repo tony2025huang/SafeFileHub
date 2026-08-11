@@ -15,7 +15,16 @@ import (
 	"github.com/example/safefilehub/internal/config"
 	"github.com/example/safefilehub/internal/db"
 	"github.com/example/safefilehub/internal/limits"
+	"github.com/example/safefilehub/internal/metrics"
 )
+
+// ReadinessChecks are intentionally shallow checks for dependencies needed to
+// accept work. They must not enumerate storage directories or object content.
+type ReadinessChecks interface {
+	Database(*http.Request) error
+	Storage(*http.Request) error
+	Disk(*http.Request) error
+}
 
 // NewServer returns an in-memory HTTP handler configured for SafeFileHub.
 func NewServer(cfg config.Config) (http.Handler, error) {
@@ -27,6 +36,25 @@ func NewServer(cfg config.Config) (http.Handler, error) {
 	mux.HandleFunc("GET /healthz", healthz)
 	mux.HandleFunc("GET /", transferUI)
 	return RequestLimits(cfg, mux), nil
+}
+
+// NewServerWithObservability is a minimal constructor for deployments that
+// need readiness and metrics before selecting a transfer route composition.
+func NewServerWithObservability(cfg config.Config, checks ReadinessChecks, m *metrics.Metrics) (http.Handler, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("validate server configuration: %w", err)
+	}
+	if checks == nil || m == nil {
+		return nil, errors.New("observability dependencies are required")
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", healthz)
+	mux.HandleFunc("GET /readyz", readyz(checks))
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		_, _ = w.Write([]byte(m.Prometheus()))
+	})
+	return RequestLimits(cfg, metricResponses(m, mux)), nil
 }
 
 type authenticator interface {
@@ -151,6 +179,17 @@ func sessionStatus(w http.ResponseWriter, _ *http.Request) {
 func healthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = w.Write([]byte("ok\n"))
+}
+
+func readyz(checks ReadinessChecks) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if checks.Database(r) != nil || checks.Storage(r) != nil || checks.Disk(r) != nil {
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte("ready\n"))
+	}
 }
 
 func sessionUploadIdentity(r *http.Request) (string, string) {

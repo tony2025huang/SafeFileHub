@@ -12,7 +12,34 @@ import (
 
 	"github.com/example/safefilehub/internal/config"
 	"github.com/example/safefilehub/internal/limits"
+	"github.com/example/safefilehub/internal/metrics"
 )
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusRecorder) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+func (w *statusRecorder) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(b)
+}
+func metricResponses(m *metrics.Metrics, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rw := &statusRecorder{ResponseWriter: w}
+		next.ServeHTTP(rw, r)
+		if rw.status == 0 {
+			rw.status = http.StatusOK
+		}
+		m.IncStatus(rw.status)
+	})
+}
 
 type UploadIdentity func(*http.Request) (user, ip string)
 
