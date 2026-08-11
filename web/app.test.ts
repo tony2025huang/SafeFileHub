@@ -12,13 +12,17 @@ import {
 } from './app.ts';
 
 test('deployment HTML loads the browser-ready JavaScript entrypoint', async () => {
-  const [html, browserEntry, source] = await Promise.all([
+  const [html, browserEntry, source, embeddedEntry, embeddedHTML] = await Promise.all([
     readFile(new URL('./index.html', import.meta.url), 'utf8'),
     readFile(new URL('./app.js', import.meta.url), 'utf8'),
     readFile(new URL('./app.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../internal/httpapi/assets/app.js', import.meta.url), 'utf8'),
+    readFile(new URL('../internal/httpapi/assets/index.html', import.meta.url), 'utf8'),
   ]);
   assert.match(html, /<script type="module" src="\.\/app\.js"><\/script>/);
   assert.equal(browserEntry, source);
+  assert.equal(embeddedEntry, browserEntry);
+  assert.equal(embeddedHTML, html);
 });
 
 function file(name, body, relative = '') {
@@ -101,6 +105,25 @@ test('special path characters round-trip unchanged through independent upload se
   assert.deepEqual(api.calls.create.map(call => call.path), names.map(name => `/drop/${name}`));
 });
 
+test('uploadAPI encodes every path segment in create JSON and IDs in request URLs', async () => {
+  const requests = [];
+  const api = (await import('./app.ts')).uploadAPI(async (url, init = {}) => {
+    requests.push({ url, init });
+    if (init.method === 'HEAD') return new Response(null, { status: 200, headers: { 'Upload-Offset': '3' } });
+    return new Response(JSON.stringify({ upload_id: 'id /?', chunk_size: 2, offset: 0 }), { status: 201 });
+  });
+  await api.create({ rootID: 1, path: 'drop/a+b/%? 空/中文😀.txt', size: 1 });
+  await api.offset('id /?');
+  assert.equal(JSON.parse(requests[0].init.body).path, 'drop/a%2Bb/%25%3F%20%E7%A9%BA/%E4%B8%AD%E6%96%87%F0%9F%98%80.txt');
+  assert.equal(requests[1].url, '/api/uploads/id%20%2F%3F');
+});
+
+test('the server accepts encoded JSON logical paths and preserves special names', async () => {
+  // The browser sends the escaped path in JSON; the Go endpoint decodes once.
+  // This assertion is exercised in the HTTP API suite, kept here as the wire contract.
+  assert.equal(encodeLogicalPath('drop/a+b/%? 空/中文😀.txt'), 'drop/a%2Bb/%25%3F%20%E7%A9%BA/%E4%B8%AD%E6%96%87%F0%9F%98%80.txt');
+});
+
 test('pause, cancel, retry, and HEAD-derived progress are available per file', async () => {
   const api = fakeAPI({ failPaths: ['/retry.txt'], chunkSize: 2 });
   const batch = createUploadBatch([file('retry.txt', 'abcd'), file('cancel.txt', 'x')], api, { rootID: 1 });
@@ -116,4 +139,31 @@ test('pause, cancel, retry, and HEAD-derived progress are available per file', a
   await batch.cancel(queued);
   assert.equal(queued.status, 'cancelled');
   assert.equal(api.calls.cancel.length, 1);
+});
+
+test('resume reads a non-zero HEAD offset and reports it immediately', async () => {
+  const events = [];
+  const api = fakeAPI({ chunkSize: 2 });
+  api.offset = async () => 2;
+  api.complete = async id => { api.calls.complete.push(id); };
+  const batch = createUploadBatch([file('resumed.txt', 'abcd')], api, { rootID: 1, onProgress: item => events.push(item.progress) });
+  const item = batch.items[0];
+  item.uploadID = 'resumed'; item.chunkSize = 2; item.status = 'paused';
+  await batch.resume(item);
+  assert.equal(item.status, 'completed');
+  assert.equal(api.calls.patch[0].offset, 2);
+  assert.ok(events.includes(0.5));
+});
+
+test('retry shares the bounded pool and reports lifecycle progress', async () => {
+  const events = [];
+  const api = fakeAPI({ failPaths: ['/retry.txt'], chunkSize: 2 });
+  const batch = createUploadBatch([file('retry.txt', 'abcd'), file('other.txt', 'abcd')], api, { rootID: 1, concurrency: 1, onProgress: item => events.push([item.path, item.status, item.progress]) });
+  await batch.start();
+  api.complete = async id => { api.calls.complete.push(id); };
+  await batch.retry(batch.items[0]);
+  assert.equal(api.calls.maxActive, 1);
+  assert.equal(batch.items[0].status, 'completed');
+  assert.ok(events.some(([, status]) => status === 'failed'));
+  assert.ok(events.some(([, status, progress]) => status === 'uploading' && progress > 0));
 });

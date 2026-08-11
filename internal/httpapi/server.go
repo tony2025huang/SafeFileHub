@@ -25,6 +25,7 @@ func NewServer(cfg config.Config) (http.Handler, error) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthz)
+	mux.HandleFunc("GET /", transferUI)
 	return RequestLimits(cfg, mux), nil
 }
 

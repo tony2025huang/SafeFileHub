@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SafeFileHub transfers</title>
+</head>
+<body>
+  <main>
+    <h1>Upload files or a directory</h1>
+    <form id="upload-form">
+      <label>Storage root ID <input id="root-id" type="number" min="1" required></label>
+      <label>Destination directory <input id="directory" value="/" required></label>
+      <label>Files <input id="files" type="file" multiple webkitdirectory></label>
+      <button type="submit">Start transfer</button>
+    </form>
+    <p id="summary" aria-live="polite"></p>
+    <ul id="uploads" aria-live="polite"></ul>
+  </main>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

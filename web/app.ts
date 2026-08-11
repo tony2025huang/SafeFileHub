@@ -19,6 +19,7 @@ export function createUploadBatch(files, api, options) {
     rootID: options.rootID,
     directory: options.directory || '/',
     concurrency: options.concurrency || DEFAULT_PER_FILE_CONCURRENCY,
+    onProgress: options.onProgress || (() => {}),
   };
   if (!Number.isInteger(settings.rootID) || settings.rootID <= 0) throw new Error('a positive rootID is required');
   if (!Number.isInteger(settings.concurrency) || settings.concurrency < 1) throw new Error('concurrency must be positive');
@@ -37,9 +38,13 @@ export function createUploadBatch(files, api, options) {
     controller: null,
   }));
 
+  function notify(item) { settings.onProgress(item); }
+  function setStatus(item, status) { item.status = status; notify(item); }
+  function reportProgress(item) { item.progress = item.file.size === 0 ? 1 : item.offset / item.file.size; notify(item); }
+
   async function run(item) {
     if (item.status === 'cancelled') return;
-    item.status = 'uploading';
+    setStatus(item, 'uploading');
     item.error = '';
     try {
       if (!item.uploadID) {
@@ -50,7 +55,7 @@ export function createUploadBatch(files, api, options) {
       } else {
         item.offset = await api.offset(item.uploadID);
       }
-      item.progress = item.file.size === 0 ? 1 : item.offset / item.file.size;
+      reportProgress(item);
       while (item.offset < item.file.size) {
         if (item.status !== 'uploading') return;
         const end = Math.min(item.offset + item.chunkSize, item.file.size);
@@ -58,49 +63,65 @@ export function createUploadBatch(files, api, options) {
         await api.patch(item.uploadID, item.offset, item.file.slice(item.offset, end), item.controller.signal);
         item.controller = null;
         item.offset = end;
-        item.progress = item.offset / item.file.size;
+        reportProgress(item);
       }
       if (item.status !== 'uploading') return;
       await api.complete(item.uploadID);
-      item.status = 'completed';
       item.progress = 1;
+      setStatus(item, 'completed');
     } catch (error) {
       item.controller = null;
       if (item.status === 'paused' || item.status === 'cancelled') return;
-      item.status = 'failed';
       item.error = error instanceof Error ? error.message : String(error);
+      setStatus(item, 'failed');
     }
   }
 
+  const queue = [];
+  let active = 0;
+  let draining = false;
+  function enqueue(item) {
+    return new Promise(resolve => { queue.push({ item, resolve }); drain(); });
+  }
+  function drain() {
+    if (draining) return;
+    draining = true;
+    const work = async () => {
+      while (queue.length || active) {
+        while (active < settings.concurrency && queue.length) {
+          const job = queue.shift(); active++;
+          run(job.item).finally(() => { active--; job.resolve(); drain(); });
+        }
+        if (active) await new Promise(resolve => setTimeout(resolve, 0));
+      }
+      draining = false;
+    };
+    void work();
+  }
   async function start() {
-    const queue = items.filter(item => item.status === 'queued');
-    let next = 0;
-    async function worker() {
-      while (next < queue.length) await run(queue[next++]);
-    }
-    await Promise.all(Array.from({ length: Math.min(settings.concurrency, queue.length) }, worker));
+    await Promise.all(items.filter(item => item.status === 'queued').map(enqueue));
     return summary();
   }
 
   function pause(item) {
     if (item.status === 'uploading') {
-      item.status = 'paused';
+      setStatus(item, 'paused');
       item.controller?.abort();
     }
   }
   async function resume(item) {
     if (item.status !== 'paused') return;
-    await run(item);
+    await enqueue(item);
   }
   async function cancel(item) {
     if (item.status === 'completed' || item.status === 'cancelled') return;
-    item.status = 'cancelled';
+    setStatus(item, 'cancelled');
     item.controller?.abort();
     if (item.uploadID) await api.cancel(item.uploadID);
   }
   async function retry(item) {
     if (item.status !== 'failed') return;
-    await run(item);
+    await enqueue(item);
   }
   function summary() {
     return items.reduce((result, item) => {
@@ -122,7 +143,7 @@ export function uploadAPI(fetchImpl = fetch) {
   return {
     async create(input) {
       const response = await checked(await fetchImpl('/api/uploads', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input), credentials: 'same-origin',
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...input, path: encodeLogicalPath(input.path) }), credentials: 'same-origin',
       }));
       const value = await response.json();
       return { uploadID: value.upload_id, chunkSize: value.chunk_size, offset: value.offset };

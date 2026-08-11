@@ -1,0 +1,10 @@
+{
+  "name": "safefilehub-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test web/app.test.ts",
+    "build": "node --check web/app.js && node --check web/app.ts"
+  },
+  "engines": { "node": ">=24" }
+}

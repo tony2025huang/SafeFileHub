@@ -89,6 +89,28 @@ func TestUploadLifecycle(t *testing.T) {
 	}
 }
 
+func TestCreateUploadDecodesBrowserEscapedLogicalPath(t *testing.T) {
+	d := t.TempDir()
+	repo, err := db.Open(context.Background(), d+"/db")
+	if err != nil { t.Fatal(err) }
+	defer repo.Close()
+	u, _ := repo.CreateUser(context.Background(), db.User{Username: "u", PasswordHash: "x"})
+	root, _ := repo.CreateStorageRoot(context.Background(), db.StorageRoot{Name: "r", Path: d})
+	_, _ = repo.CreatePermission(context.Background(), db.Permission{UserID: u.ID, RootID: root.ID, PathPrefix: "/", Action: "write", Allow: true})
+	store, _ := storage.NewObjectStore(d); defer store.Close()
+	sessions := auth.NewSessionManager(auth.NewMemorySessionStore(), auth.SessionConfig{TTL: time.Hour}); defer sessions.Close()
+	sid, _ := sessions.Create(context.Background(), u.ID)
+	h, err := NewServerWithUploads(config.Default(), rejectingAuthenticator{}, sessions, repo, permission.NewAuthorizer(repo, config.Default().NamePolicy), store)
+	if err != nil { t.Fatal(err) }
+	body := `{"root_id":1,"path":"drop/a%2Bb/%25%3F%20%E7%A9%BA/%E4%B8%AD%E6%96%87%F0%9F%98%80.txt","size":1}`
+	req := httptest.NewRequest(http.MethodPost, "/api/uploads", bytes.NewBufferString(body)); req.AddCookie(&http.Cookie{Name: sessions.CookieName(), Value: sid})
+	rr := httptest.NewRecorder(); h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusCreated { t.Fatalf("create = %d: %s", rr.Code, rr.Body.String()) }
+	var out uploadResponse; if err := json.NewDecoder(rr.Body).Decode(&out); err != nil { t.Fatal(err) }
+	s, err := repo.UploadSessionByID(context.Background(), out.UploadID); if err != nil { t.Fatal(err) }
+	if got, want := s.LogicalPath, "/drop/a+b/%? 空/中文😀.txt"; got != want { t.Fatalf("logical path = %q, want %q", got, want) }
+}
+
 func TestUploadSessionAuthorizationUsesOperationPermission(t *testing.T) {
 	d := t.TempDir()
 	repo, err := db.Open(context.Background(), d+"/db")

@@ -12,6 +12,7 @@ import (
 	"github.com/example/safefilehub/internal/storage"
 	"github.com/example/safefilehub/internal/upload"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -58,6 +59,7 @@ func NewServerWithUploads(cfg config.Config, users authenticator, sessions sessi
 	m := upload.New(repo, store, cfg.ChunkSize, cfg.UploadSessionTTL)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthz)
+	mux.HandleFunc("GET /", transferUI)
 	mux.HandleFunc("POST /login", login(users, sessions))
 	mux.HandleFunc("POST /logout", logout(sessions))
 	mux.Handle("GET /session", requireSession(sessions, http.HandlerFunc(sessionStatus)))
@@ -84,7 +86,12 @@ func createUpload(m *upload.Manager, repo uploadRepository, a uploadAuthorizer, 
 			http.Error(w, "invalid upload", http.StatusBadRequest)
 			return
 		}
-		p, err := pathpolicy.ParseDecodedPath(in.Path, cfg.NamePolicy)
+		decodedPath, err := url.PathUnescape(in.Path)
+		if err != nil {
+			http.Error(w, "invalid path", http.StatusBadRequest)
+			return
+		}
+		p, err := pathpolicy.ParseDecodedPath(decodedPath, cfg.NamePolicy)
 		if err != nil {
 			http.Error(w, "invalid path", 400)
 			return
