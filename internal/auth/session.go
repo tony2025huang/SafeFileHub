@@ -31,21 +31,29 @@ type SessionStore interface {
 	DeleteExpired(context.Context, time.Time, int) (int, error)
 }
 type SessionConfig struct {
-	CookieName string
-	TTL        time.Duration
-	Secure     bool
-	SameSite   http.SameSite
-	Now        func() time.Time
+	CookieName       string
+	TTL              time.Duration
+	Secure           bool
+	SameSite         http.SameSite
+	Now              func() time.Time
+	LifecycleContext context.Context
+	GCDeleteTimeout  time.Duration
 }
 
 const sessionGCMaxDeletes = 64
+const defaultGCDeleteTimeout = 5 * time.Second
 
 type SessionManager struct {
 	store  SessionStore
 	config SessionConfig
 
-	gcMu      sync.Mutex
-	gcRunning bool
+	lifecycleCtx    context.Context
+	cancelLifecycle context.CancelFunc
+	closeOnce       sync.Once
+	gcMu            sync.Mutex
+	gcRunning       bool
+	closed          bool
+	gcWG            sync.WaitGroup
 }
 
 func NewSessionManager(store SessionStore, config SessionConfig) *SessionManager {
@@ -61,7 +69,14 @@ func NewSessionManager(store SessionStore, config SessionConfig) *SessionManager
 	if config.Now == nil {
 		config.Now = time.Now
 	}
-	return &SessionManager{store: store, config: config}
+	if config.GCDeleteTimeout <= 0 {
+		config.GCDeleteTimeout = defaultGCDeleteTimeout
+	}
+	if config.LifecycleContext == nil {
+		config.LifecycleContext = context.Background()
+	}
+	lifecycleCtx, cancelLifecycle := context.WithCancel(config.LifecycleContext)
+	return &SessionManager{store: store, config: config, lifecycleCtx: lifecycleCtx, cancelLifecycle: cancelLifecycle}
 }
 func (m *SessionManager) Create(ctx context.Context, userID int64) (string, error) {
 	// Maintenance must never delay authentication. A single background worker
@@ -78,6 +93,21 @@ func (m *SessionManager) Create(ctx context.Context, userID int64) (string, erro
 	}
 	return id, nil
 }
+
+// Revoke deletes the supplied server-side session. Session authorization is
+// always resolved from this store; the client cookie contains only the opaque ID.
+func (m *SessionManager) Revoke(ctx context.Context, id string) error {
+	if id == "" {
+		return nil
+	}
+	return m.store.Delete(ctx, id)
+}
+
+// Logout revokes the supplied server-side session.
+func (m *SessionManager) Logout(ctx context.Context, id string) error {
+	return m.Revoke(ctx, id)
+}
+
 func (m *SessionManager) UserID(ctx context.Context, id string) (int64, error) {
 	s, err := m.store.Lookup(ctx, id)
 	if err != nil {
@@ -99,10 +129,11 @@ func (m *SessionManager) GC(ctx context.Context) (int, error) {
 func (m *SessionManager) scheduleGC(now time.Time) {
 	m.gcMu.Lock()
 	defer m.gcMu.Unlock()
-	if m.gcRunning {
+	if m.gcRunning || m.closed {
 		return
 	}
 	m.gcRunning = true
+	m.gcWG.Add(1)
 	go m.runGC(now)
 }
 
@@ -114,13 +145,18 @@ func (m *SessionManager) runGC(now time.Time) {
 		m.gcMu.Lock()
 		m.gcRunning = false
 		m.gcMu.Unlock()
+		m.gcWG.Done()
 	}()
 	for {
-		deleted, err := m.store.DeleteExpired(context.Background(), now, sessionGCMaxDeletes)
+		ctx, cancel := context.WithTimeout(m.lifecycleCtx, m.config.GCDeleteTimeout)
+		deleted, err := m.store.DeleteExpired(ctx, now, sessionGCMaxDeletes)
+		cancel()
 		if err != nil {
-			// Authentication remains available; report failed maintenance instead
-			// of silently discarding an operational signal.
-			log.Printf("auth: session garbage collection failed: %v", err)
+			if m.lifecycleCtx.Err() == nil {
+				// Authentication remains available; report failed maintenance instead
+				// of silently discarding an operational signal.
+				log.Printf("auth: session garbage collection failed: %v", err)
+			}
 			return
 		}
 		if deleted < sessionGCMaxDeletes {
@@ -129,10 +165,28 @@ func (m *SessionManager) runGC(now time.Time) {
 	}
 }
 
+// Close stops the background GC worker and prevents future workers from starting.
+func (m *SessionManager) Close() {
+	m.closeOnce.Do(func() {
+		m.gcMu.Lock()
+		m.closed = true
+		m.gcMu.Unlock()
+		m.cancelLifecycle()
+		m.gcWG.Wait()
+	})
+}
+
 func (m *SessionManager) SetCookie(w http.ResponseWriter, id string) {
 	now := m.config.Now().UTC()
 	http.SetCookie(w, &http.Cookie{Name: m.config.CookieName, Value: id, Path: "/", Expires: now.Add(m.config.TTL), MaxAge: int(m.config.TTL.Seconds()), Secure: m.config.Secure, HttpOnly: true, SameSite: m.config.SameSite})
 }
+
+// ClearSessionCookie invalidates the client cookie using the same security attributes.
+func (m *SessionManager) ClearSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{Name: m.config.CookieName, Value: "", Path: "/", Expires: m.config.Now().UTC().Add(-time.Second), MaxAge: -1, Secure: m.config.Secure, HttpOnly: true, SameSite: m.config.SameSite})
+}
+
+func (m *SessionManager) CookieName() string { return m.config.CookieName }
 
 type memorySessionStore struct {
 	mu       sync.Mutex

@@ -2,10 +2,14 @@
 package httpapi
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 
 	"github.com/example/safefilehub/internal/config"
+	"github.com/example/safefilehub/internal/db"
 )
 
 // NewServer returns an in-memory HTTP handler configured for SafeFileHub.
@@ -17,6 +21,105 @@ func NewServer(cfg config.Config) (http.Handler, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthz)
 	return mux, nil
+}
+
+type authenticator interface {
+	Authenticate(context.Context, string, string) (db.User, error)
+}
+
+type sessionManager interface {
+	Create(context.Context, int64) (string, error)
+	Logout(context.Context, string) error
+	UserID(context.Context, string) (int64, error)
+	SetCookie(http.ResponseWriter, string)
+	ClearSessionCookie(http.ResponseWriter)
+	CookieName() string
+}
+
+// NewServerWithAuth adds the minimal Task 4 authentication surface. File
+// storage endpoints deliberately remain out of scope until Task 5.
+func NewServerWithAuth(cfg config.Config, users authenticator, sessions sessionManager) (http.Handler, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("validate server configuration: %w", err)
+	}
+	if users == nil || sessions == nil {
+		return nil, errors.New("authentication dependencies are required")
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", healthz)
+	mux.HandleFunc("POST /login", login(users, sessions))
+	mux.HandleFunc("POST /logout", logout(sessions))
+	mux.Handle("GET /session", requireSession(sessions, http.HandlerFunc(sessionStatus)))
+	return mux, nil
+}
+
+type loginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+func login(users authenticator, sessions sessionManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var input loginRequest
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&input); err != nil {
+			http.Error(w, "invalid credentials", http.StatusUnauthorized)
+			return
+		}
+		user, err := users.Authenticate(r.Context(), input.Username, input.Password)
+		if err != nil {
+			http.Error(w, "invalid credentials", http.StatusUnauthorized)
+			return
+		}
+		id, err := sessions.Create(r.Context(), user.ID)
+		if err != nil {
+			http.Error(w, "create session", http.StatusInternalServerError)
+			return
+		}
+		sessions.SetCookie(w, id)
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func logout(sessions sessionManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if cookie, err := r.Cookie(sessions.CookieName()); err == nil {
+			if err := sessions.Logout(r.Context(), cookie.Value); err != nil {
+				http.Error(w, "revoke session", http.StatusInternalServerError)
+				return
+			}
+		}
+		sessions.ClearSessionCookie(w)
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+type sessionUserIDKey struct{}
+
+func requireSession(sessions sessionManager, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cookie, err := r.Cookie(sessions.CookieName())
+		if err != nil || cookie.Value == "" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		userID, err := sessions.UserID(r.Context(), cookie.Value)
+		if err != nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if userID <= 0 {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), sessionUserIDKey{}, userID)))
+	})
+}
+
+func sessionStatus(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte("authenticated\n"))
 }
 
 func healthz(w http.ResponseWriter, _ *http.Request) {

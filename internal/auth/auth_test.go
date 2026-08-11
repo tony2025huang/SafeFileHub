@@ -222,6 +222,77 @@ func TestSessionManagerConcurrentCreateLookupAndGCAreRaceSafe(t *testing.T) {
 	wg.Wait()
 }
 
+func TestLogoutRevokesSessionAndClearsMatchingCookie(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
+	store := auth.NewMemorySessionStore()
+	manager := auth.NewSessionManager(store, auth.SessionConfig{
+		CookieName: "custom_session", TTL: time.Hour, Secure: true, SameSite: http.SameSiteStrictMode, Now: func() time.Time { return now },
+	})
+	id, err := manager.Create(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := manager.Logout(context.Background(), id); err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+	if _, err := manager.UserID(context.Background(), id); !errors.Is(err, auth.ErrSessionNotFound) {
+		t.Fatalf("revoked session lookup = %v, want ErrSessionNotFound", err)
+	}
+
+	rr := httptest.NewRecorder()
+	manager.ClearSessionCookie(rr)
+	cookie := rr.Result().Cookies()[0]
+	if cookie.Name != "custom_session" || cookie.Value != "" || cookie.Path != "/" || cookie.MaxAge != -1 || !cookie.Expires.Before(now) || !cookie.HttpOnly || !cookie.Secure || cookie.SameSite != http.SameSiteStrictMode {
+		t.Fatalf("cleared cookie = %#v", cookie)
+	}
+}
+
+func TestSessionManagerCloseCancelsBlockedGCAndPreventsRestart(t *testing.T) {
+	store := &contextBlockingSessionStore{SessionStore: auth.NewMemorySessionStore(), entered: make(chan struct{}, 1), exited: make(chan struct{})}
+	manager := auth.NewSessionManager(store, auth.SessionConfig{TTL: time.Hour, GCDeleteTimeout: time.Hour})
+	if _, err := manager.Create(context.Background(), 1); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	select {
+	case <-store.entered:
+	case <-time.After(time.Second):
+		t.Fatal("GC did not enter DeleteExpired")
+	}
+	manager.Close()
+	select {
+	case <-store.exited:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not wait for GC worker to exit")
+	}
+	calls := store.calls.Load()
+	if _, err := manager.Create(context.Background(), 2); err != nil {
+		t.Fatalf("Create after Close: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if got := store.calls.Load(); got != calls {
+		t.Fatalf("GC calls after Close = %d, want %d", got, calls)
+	}
+}
+
+type contextBlockingSessionStore struct {
+	auth.SessionStore
+	entered chan struct{}
+	exited  chan struct{}
+	calls   atomic.Int32
+}
+
+func (s *contextBlockingSessionStore) DeleteExpired(ctx context.Context, _ time.Time, _ int) (int, error) {
+	s.calls.Add(1)
+	select {
+	case s.entered <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	close(s.exited)
+	return 0, ctx.Err()
+}
+
 func TestSessionCookieCanDisableSecureFlag(t *testing.T) {
 	t.Parallel()
 	manager := auth.NewSessionManager(auth.NewMemorySessionStore(), auth.SessionConfig{TTL: time.Hour, Secure: false})
@@ -260,5 +331,39 @@ func TestSessionCookieUsesConfiguredSameSiteAndExpiresWithTTL(t *testing.T) {
 	}
 	if cookie.MaxAge != int((90*time.Minute).Seconds()) || !cookie.Expires.Equal(now.Add(90*time.Minute)) {
 		t.Fatalf("cookie expiry = MaxAge %d, Expires %s; want %d, %s", cookie.MaxAge, cookie.Expires, int((90 * time.Minute).Seconds()), now.Add(90*time.Minute))
+	}
+}
+
+func TestRevokeDeletesServerSideSession(t *testing.T) {
+	store := auth.NewMemorySessionStore()
+	manager := auth.NewSessionManager(store, auth.SessionConfig{TTL: time.Hour})
+	id, err := manager.Create(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := manager.Revoke(context.Background(), id); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+	if _, err := manager.UserID(context.Background(), id); !errors.Is(err, auth.ErrSessionNotFound) {
+		t.Fatalf("revoked session lookup = %v, want ErrSessionNotFound", err)
+	}
+}
+
+func TestSessionManagerGCTimeoutCancelsBlockingStore(t *testing.T) {
+	store := &contextBlockingSessionStore{SessionStore: auth.NewMemorySessionStore(), entered: make(chan struct{}, 1), exited: make(chan struct{})}
+	manager := auth.NewSessionManager(store, auth.SessionConfig{TTL: time.Hour, GCDeleteTimeout: 20 * time.Millisecond})
+	defer manager.Close()
+	if _, err := manager.Create(context.Background(), 1); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	select {
+	case <-store.entered:
+	case <-time.After(time.Second):
+		t.Fatal("GC did not enter DeleteExpired")
+	}
+	select {
+	case <-store.exited:
+	case <-time.After(time.Second):
+		t.Fatal("GC timeout did not release blocking store")
 	}
 }
