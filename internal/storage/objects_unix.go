@@ -385,7 +385,7 @@ func (s *ObjectStore) StagingNames(limit int) ([]string, error) {
 	f := os.NewFile(uintptr(d), "staging")
 	defer f.Close()
 	entries, err := f.ReadDir(limit)
-	if err != nil {
+	if err != nil && err != io.EOF {
 		return nil, err
 	}
 	result := make([]string, 0, len(entries))

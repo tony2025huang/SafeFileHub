@@ -30,6 +30,7 @@ type Session struct {
 type repository interface {
 	CreateUploadSession(context.Context, db.UploadSession) (db.UploadSession, error)
 	UploadSessionByID(context.Context, string) (db.UploadSession, error)
+	UploadSessions(context.Context, int) ([]db.UploadSession, error)
 	UpdateUploadOffset(context.Context, string, int64, int64) error
 	UpdateUploadStatus(context.Context, string, string, string) error
 	DeleteUploadSession(context.Context, string) error
@@ -262,6 +263,23 @@ func (m *Manager) cleanupLocked(ctx context.Context, s db.UploadSession) error {
 	}
 	return nil
 }
+
+// recoverableStaging verifies that a session remains safe to expose as writable.
+// OpenStaging uses O_NOFOLLOW and the regular-file/offset checks reject missing,
+// symlinked, directory, unreadable, or corrupted staging entries.
+func recoverableStaging(s db.UploadSession, store *storage.ObjectStore) bool {
+	if s.Status != "active" || !s.ExpiresAt.After(time.Now()) {
+		return false
+	}
+	f, err := store.OpenStaging(s.StagingPath)
+	if err != nil {
+		return false
+	}
+	info, statErr := f.Stat()
+	closeErr := f.Close()
+	return statErr == nil && closeErr == nil && info.Mode().IsRegular() && info.Size() == s.Offset
+}
+
 func (m *Manager) lock(id string) *sync.Mutex {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -309,64 +327,37 @@ func (m *Manager) Recover(ctx context.Context, limit int, dryRun bool) (Recovery
 	if limit <= 0 || limit > 64 {
 		limit = 64
 	}
-	names, err := m.store.StagingNames(limit)
+	sessions, err := m.repo.UploadSessions(ctx, limit)
 	if err != nil {
 		return RecoveryReport{}, err
 	}
-	report := RecoveryReport{Checked: len(names)}
-	for _, name := range names {
+	// A recovery run has one shared work budget: database rows are authoritative
+	// (and therefore take priority over orphan discovery), then only remaining
+	// capacity is spent on staging-only names.
+	names, err := m.store.StagingNames(limit - len(sessions))
+	if err != nil {
+		return RecoveryReport{}, err
+	}
+	report := RecoveryReport{Checked: len(sessions)}
+	seen := make(map[string]struct{}, len(sessions))
+	for _, s := range sessions {
+		seen[s.StagingPath] = struct{}{}
 		if err := ctx.Err(); err != nil {
 			return report, err
 		}
-		id := strings.TrimSuffix(strings.TrimPrefix(name, "staging/"), ".part")
-		s, err := m.repo.UploadSessionByID(ctx, id)
-		if errors.Is(err, db.ErrNotFound) {
-			// An orphan has no row from which withLifecycleLock can derive its
-			// pathname. Lock its stable sidecar and re-check DB before unlinking,
-			// so a concurrent creator/recovery cannot lose a newly-live part.
-			lock, lockErr := m.store.LockStagingLifecycle(name)
-			if lockErr != nil {
-				return report, lockErr
-			}
-			_, checkErr := m.repo.UploadSessionByID(ctx, id)
-			if errors.Is(checkErr, db.ErrNotFound) {
-				if !dryRun {
-					checkErr = m.store.RemoveStaging(name)
-				}
-				report.Orphans++
-			}
-			unlockErr := m.store.UnlockStagingLifecycle(lock)
-			if checkErr != nil && !errors.Is(checkErr, db.ErrNotFound) {
-				return report, checkErr
-			}
-			if unlockErr != nil {
-				return report, unlockErr
-			}
-			continue
-		}
-		if err != nil {
-			return report, err
-		}
 		var kept bool
-		err = m.withLifecycleLock(ctx, s.ID, func(locked db.UploadSession) error {
-			f, openErr := m.store.OpenStaging(locked.StagingPath)
-			valid := openErr == nil
-			if valid {
-				info, statErr := f.Stat()
-				_ = f.Close()
-				valid = statErr == nil && info.Mode().IsRegular() && info.Size() == locked.Offset
-			}
-			if locked.Status == "active" && locked.ExpiresAt.After(time.Now()) && valid {
-				kept = true
-				return nil
-			}
-			if dryRun {
-				return nil
-			}
-			return m.cleanupLocked(ctx, locked)
-		})
+		if dryRun {
+			kept = recoverableStaging(s, m.store)
+		} else {
+			err = m.withLifecycleLock(ctx, s.ID, func(locked db.UploadSession) error {
+				if recoverableStaging(locked, m.store) {
+					kept = true
+					return nil
+				}
+				return m.cleanupLocked(ctx, locked)
+			})
+		}
 		if errors.Is(err, db.ErrNotFound) {
-			// A competing cleanup already converged; the part is not live.
 			report.Cancelled++
 			continue
 		}
@@ -377,6 +368,44 @@ func (m *Manager) Recover(ctx context.Context, limit int, dryRun bool) (Recovery
 			report.Kept++
 		} else {
 			report.Cancelled++
+		}
+	}
+	for _, name := range names {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return report, err
+		}
+		id := strings.TrimSuffix(strings.TrimPrefix(name, "staging/"), ".part")
+		// The name may belong to a row outside this bounded DB page; it is not
+		// an orphan and will be reconciled by a later run.
+		if _, err := m.repo.UploadSessionByID(ctx, id); err == nil {
+			continue
+		} else if !errors.Is(err, db.ErrNotFound) {
+			return report, err
+		}
+		report.Checked++
+		// An orphan has no row from which withLifecycleLock can derive its
+		// pathname. Lock its stable sidecar and re-check DB before unlinking,
+		// so a concurrent creator/recovery cannot lose a newly-live part.
+		lock, lockErr := m.store.LockStagingLifecycle(name)
+		if lockErr != nil {
+			return report, lockErr
+		}
+		_, checkErr := m.repo.UploadSessionByID(ctx, id)
+		if errors.Is(checkErr, db.ErrNotFound) {
+			if !dryRun {
+				checkErr = m.store.RemoveStaging(name)
+			}
+			report.Orphans++
+		}
+		unlockErr := m.store.UnlockStagingLifecycle(lock)
+		if checkErr != nil && !errors.Is(checkErr, db.ErrNotFound) {
+			return report, checkErr
+		}
+		if unlockErr != nil {
+			return report, unlockErr
 		}
 	}
 	return report, nil

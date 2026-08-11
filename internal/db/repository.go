@@ -250,6 +250,33 @@ func (r *Repository) CreateUploadSession(ctx context.Context, session UploadSess
 	return session, nil
 }
 
+// UploadSessions returns a bounded, deterministic maintenance snapshot. Callers
+// must re-read each row under its lifecycle lock before acting on it.
+func (r *Repository) UploadSessions(ctx context.Context, limit int) ([]UploadSession, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT id, user_id, root_id, logical_path, staging_path, offset, length, status, expires_at, created_at, updated_at FROM upload_sessions WHERE status IN ('active', 'cancelled', 'cleanup_pending') ORDER BY id LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query upload sessions: %w", err)
+	}
+	defer rows.Close()
+	sessions := make([]UploadSession, 0, limit)
+	for rows.Next() {
+		var s UploadSession
+		var expiresAt, createdAt, updatedAt int64
+		if err := rows.Scan(&s.ID, &s.UserID, &s.RootID, &s.LogicalPath, &s.StagingPath, &s.Offset, &s.Length, &s.Status, &expiresAt, &createdAt, &updatedAt); err != nil {
+			return nil, fmt.Errorf("scan upload session: %w", err)
+		}
+		s.ExpiresAt, s.CreatedAt, s.UpdatedAt = fromUnixNano(expiresAt), fromUnixNano(createdAt), fromUnixNano(updatedAt)
+		sessions = append(sessions, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate upload sessions: %w", err)
+	}
+	return sessions, nil
+}
+
 func (r *Repository) UploadSessionByID(ctx context.Context, id string) (UploadSession, error) {
 	var session UploadSession
 	var expiresAt, createdAt, updatedAt int64

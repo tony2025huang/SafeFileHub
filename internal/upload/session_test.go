@@ -756,3 +756,160 @@ func TestRecoverReportsStorageErrors(t *testing.T) {
 		t.Fatal("Recover hid storage error")
 	}
 }
+
+// A live session must be found from durable metadata even when its .part was
+// lost before restart. StagingNames cannot discover this case.
+func TestRecoverReconcilesMissingActiveStagingFromDatabase(t *testing.T) {
+	root := t.TempDir()
+	store, err := storage.NewObjectStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := db.Open(context.Background(), root+"/meta.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, _ := repo.CreateUser(context.Background(), db.User{Username: "missing", PasswordHash: "x"})
+	r, _ := repo.CreateStorageRoot(context.Background(), db.StorageRoot{Name: "missing", Path: root})
+	creator := New(repo, store, 1, time.Hour)
+	s, err := creator.Create(context.Background(), u.ID, r.ID, "/missing", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := repo.UploadSessionByID(context.Background(), s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RemoveStaging(persisted.StagingPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate restart: a fresh store/repository/manager must not retain a
+	// writable active row whose staging inode no longer exists.
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restartedStore, err := storage.NewObjectStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restartedStore.Close()
+	restartedRepo, err := db.Open(context.Background(), root+"/meta.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restartedRepo.Close()
+	restarted := New(restartedRepo, restartedStore, 1, time.Hour)
+	report, err := restarted.Recover(context.Background(), 64, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Checked != 1 || report.Cancelled != 1 {
+		t.Fatalf("report = %#v", report)
+	}
+	if _, err := restartedRepo.UploadSessionByID(context.Background(), s.ID); !errors.Is(err, db.ErrNotFound) {
+		t.Fatalf("missing-part session remained writable: %v", err)
+	}
+	if _, err := restarted.Write(context.Background(), s.ID, 0, bytes.NewBufferString("abc")); !errors.Is(err, db.ErrNotFound) {
+		t.Fatalf("Write on recovered missing-part session = %v, want ErrNotFound", err)
+	}
+}
+
+func TestRecoverMissingActiveStagingDryRunOnlyReports(t *testing.T) {
+	root := t.TempDir()
+	store, err := storage.NewObjectStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	repo, err := db.Open(context.Background(), root+"/meta.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	u, _ := repo.CreateUser(context.Background(), db.User{Username: "missing-dry", PasswordHash: "x"})
+	r, _ := repo.CreateStorageRoot(context.Background(), db.StorageRoot{Name: "missing-dry", Path: root})
+	m := New(repo, store, 1, time.Hour)
+	s, err := m.Create(context.Background(), u.ID, r.ID, "/missing-dry", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, _ := repo.UploadSessionByID(context.Background(), s.ID)
+	if err := store.RemoveStaging(persisted.StagingPath); err != nil {
+		t.Fatal(err)
+	}
+	report, err := m.Recover(context.Background(), 64, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Checked != 1 || report.Cancelled != 1 {
+		t.Fatalf("dry report = %#v", report)
+	}
+	after, err := repo.UploadSessionByID(context.Background(), s.ID)
+	if err != nil || after.Status != "active" {
+		t.Fatalf("dry run mutated missing-part session: %#v, %v", after, err)
+	}
+	if _, err := os.Stat(root + "/" + persisted.StagingPath + ".lock"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dry run created lifecycle sidecar: %v", err)
+	}
+}
+
+func TestRecoverOnlyEnumeratesRecoverableLifecycleStates(t *testing.T) {
+	root := t.TempDir()
+	store, err := storage.NewObjectStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	repo, err := db.Open(context.Background(), root+"/meta.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	u, _ := repo.CreateUser(context.Background(), db.User{Username: "states", PasswordHash: "x"})
+	r, _ := repo.CreateStorageRoot(context.Background(), db.StorageRoot{Name: "states", Path: root})
+	m := New(repo, store, 1, time.Hour)
+
+	_, err = m.Create(context.Background(), u.ID, r.ID, "/active", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled, err := m.Create(context.Background(), u.ID, r.ID, "/cancelled", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := m.Create(context.Background(), u.ID, r.ID, "/pending", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	complete, err := m.Create(context.Background(), u.ID, r.ID, "/complete", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.UpdateUploadStatus(context.Background(), cancelled.ID, "active", "cancelled"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.UpdateUploadStatus(context.Background(), pending.ID, "active", "cancelled"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.UpdateUploadStatus(context.Background(), pending.ID, "cancelled", "cleanup_pending"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.UpdateUploadStatus(context.Background(), complete.ID, "active", "complete"); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := m.Recover(context.Background(), 64, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Checked != 3 || report.Kept != 1 || report.Cancelled != 2 {
+		t.Fatalf("report = %#v, want exactly active/cancelled/cleanup_pending rows", report)
+	}
+	if got, err := repo.UploadSessionByID(context.Background(), complete.ID); err != nil || got.Status != "complete" {
+		t.Fatalf("complete session was treated as recoverable: %#v, %v", got, err)
+	}
+}
