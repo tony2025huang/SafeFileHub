@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -42,6 +43,9 @@ const sessionGCMaxDeletes = 64
 type SessionManager struct {
 	store  SessionStore
 	config SessionConfig
+
+	gcMu      sync.Mutex
+	gcRunning bool
 }
 
 func NewSessionManager(store SessionStore, config SessionConfig) *SessionManager {
@@ -60,7 +64,10 @@ func NewSessionManager(store SessionStore, config SessionConfig) *SessionManager
 	return &SessionManager{store: store, config: config}
 }
 func (m *SessionManager) Create(ctx context.Context, userID int64) (string, error) {
-	m.gc(ctx)
+	// Maintenance must never delay authentication. A single background worker
+	// drains expired sessions in bounded batches; it deliberately does not use
+	// the request context so client cancellation cannot abandon cleanup.
+	m.scheduleGC(m.config.Now().UTC())
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
@@ -89,8 +96,37 @@ func (m *SessionManager) GC(ctx context.Context) (int, error) {
 	return m.store.DeleteExpired(ctx, m.config.Now().UTC(), sessionGCMaxDeletes)
 }
 
-func (m *SessionManager) gc(ctx context.Context) {
-	_, _ = m.GC(ctx)
+func (m *SessionManager) scheduleGC(now time.Time) {
+	m.gcMu.Lock()
+	defer m.gcMu.Unlock()
+	if m.gcRunning {
+		return
+	}
+	m.gcRunning = true
+	go m.runGC(now)
+}
+
+// runGC is the only automatic GC worker. Each pass is bounded, and the
+// worker exits as soon as a pass is not full. This both eventually drains a
+// backlog and prevents concurrent Create calls from multiplying GC work.
+func (m *SessionManager) runGC(now time.Time) {
+	defer func() {
+		m.gcMu.Lock()
+		m.gcRunning = false
+		m.gcMu.Unlock()
+	}()
+	for {
+		deleted, err := m.store.DeleteExpired(context.Background(), now, sessionGCMaxDeletes)
+		if err != nil {
+			// Authentication remains available; report failed maintenance instead
+			// of silently discarding an operational signal.
+			log.Printf("auth: session garbage collection failed: %v", err)
+			return
+		}
+		if deleted < sessionGCMaxDeletes {
+			return
+		}
+	}
 }
 
 func (m *SessionManager) SetCookie(w http.ResponseWriter, id string) {

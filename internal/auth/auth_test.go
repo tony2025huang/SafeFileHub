@@ -3,10 +3,13 @@ package auth_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -109,23 +112,114 @@ func TestSessionCookieIsSecureAsConfiguredAndExpires(t *testing.T) {
 	}
 }
 
-func TestSessionManagerGarbageCollectsUnaccessedExpiredSessions(t *testing.T) {
+func TestSessionManagerGCIsBoundedAndPreservesFreshSessions(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
 	store := auth.NewMemorySessionStore()
-	manager := auth.NewSessionManager(store, auth.SessionConfig{
-		TTL: time.Hour,
-		Now: func() time.Time { return now },
-	})
-	if err := store.Create(context.Background(), auth.Session{ID: "expired", UserID: 1, ExpiresAt: now.Add(-time.Second)}); err != nil {
-		t.Fatalf("seed expired session: %v", err)
+	manager := auth.NewSessionManager(store, auth.SessionConfig{TTL: time.Hour, Now: func() time.Time { return now }})
+	for i := 0; i < 65; i++ {
+		if err := store.Create(context.Background(), auth.Session{ID: fmt.Sprintf("expired-%d", i), UserID: 1, ExpiresAt: now.Add(-time.Second)}); err != nil {
+			t.Fatalf("seed expired session: %v", err)
+		}
+	}
+	if err := store.Create(context.Background(), auth.Session{ID: "fresh", UserID: 2, ExpiresAt: now.Add(time.Hour)}); err != nil {
+		t.Fatalf("seed fresh session: %v", err)
+	}
+	deleted, err := manager.GC(context.Background())
+	if err != nil || deleted != 64 {
+		t.Fatalf("GC = %d, %v; want 64, nil", deleted, err)
+	}
+	if _, err := store.Lookup(context.Background(), "fresh"); err != nil {
+		t.Fatalf("fresh session was deleted: %v", err)
+	}
+}
+
+type blockingSessionStore struct {
+	auth.SessionStore
+	entered chan struct{}
+	release chan struct{}
+	calls   atomic.Int32
+}
+
+func (s *blockingSessionStore) DeleteExpired(ctx context.Context, now time.Time, limit int) (int, error) {
+	s.calls.Add(1)
+	select {
+	case s.entered <- struct{}{}:
+	default:
+	}
+	<-s.release
+	return s.SessionStore.DeleteExpired(ctx, now, limit)
+}
+
+func TestSessionManagerCreateDoesNotSynchronouslyRunGC(t *testing.T) {
+	store := &blockingSessionStore{SessionStore: auth.NewMemorySessionStore(), entered: make(chan struct{}, 1), release: make(chan struct{})}
+	manager := auth.NewSessionManager(store, auth.SessionConfig{TTL: time.Hour})
+	created := make(chan error, 1)
+	go func() { _, err := manager.Create(context.Background(), 1); created <- err }()
+	select {
+	case err := <-created:
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Create blocked on session GC")
+	}
+	select {
+	case <-store.entered:
+	case <-time.After(time.Second):
+		t.Fatal("Create did not schedule maintenance GC")
+	}
+	close(store.release)
+}
+
+func TestSessionManagerEventuallyDrainsUnaccessedExpiredBacklog(t *testing.T) {
+	now := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
+	store := auth.NewMemorySessionStore()
+	manager := auth.NewSessionManager(store, auth.SessionConfig{TTL: time.Hour, Now: func() time.Time { return now }})
+	for i := 0; i < 130; i++ {
+		if err := store.Create(context.Background(), auth.Session{ID: fmt.Sprintf("expired-%d", i), UserID: 1, ExpiresAt: now.Add(-time.Second)}); err != nil {
+			t.Fatalf("seed expired session: %v", err)
+		}
 	}
 	if _, err := manager.Create(context.Background(), 2); err != nil {
-		t.Fatalf("create session: %v", err)
+		t.Fatalf("Create: %v", err)
 	}
-	if _, err := store.Lookup(context.Background(), "expired"); !errors.Is(err, auth.ErrSessionNotFound) {
-		t.Fatalf("expired session after GC = %v, want ErrSessionNotFound", err)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		allDeleted := true
+		for i := 0; i < 130; i++ {
+			if _, err := store.Lookup(context.Background(), fmt.Sprintf("expired-%d", i)); !errors.Is(err, auth.ErrSessionNotFound) {
+				allDeleted = false
+				break
+			}
+		}
+		if allDeleted {
+			return
+		}
+		time.Sleep(time.Millisecond)
 	}
+	t.Fatal("background GC did not drain expired backlog")
+}
+
+func TestSessionManagerConcurrentCreateLookupAndGCAreRaceSafe(t *testing.T) {
+	store := auth.NewMemorySessionStore()
+	manager := auth.NewSessionManager(store, auth.SessionConfig{TTL: time.Hour})
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				id, err := manager.Create(ctx, int64(j))
+				if err == nil {
+					_, _ = manager.UserID(ctx, id)
+				}
+				_, _ = manager.GC(ctx)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func TestSessionCookieCanDisableSecureFlag(t *testing.T) {
