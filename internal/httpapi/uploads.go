@@ -24,6 +24,7 @@ type uploadRepository interface {
 	CreateUploadSession(context.Context, db.UploadSession) (db.UploadSession, error)
 	UploadSessionByID(context.Context, string) (db.UploadSession, error)
 	UpdateUploadOffset(context.Context, string, int64, int64) error
+	UpdateUploadStatus(context.Context, string, string, string) error
 	DeleteUploadSession(context.Context, string) error
 }
 type uploadAuthorizer interface {

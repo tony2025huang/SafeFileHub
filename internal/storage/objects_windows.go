@@ -35,3 +35,16 @@ func (s *ObjectStore) Create(logicalPath string) (string, io.WriteCloser, error)
 func (s *ObjectStore) Open(key string) (*os.File, error) {
 	return nil, ErrUnsupportedPlatform
 }
+
+func (s *ObjectStore) CreateStaging(name string) (*os.File, error) {
+	return nil, ErrUnsupportedPlatform
+}
+func (s *ObjectStore) OpenStaging(name string) (*os.File, error) { return nil, ErrUnsupportedPlatform }
+func (s *ObjectStore) OpenStagingWrite(name string) (*os.File, error) {
+	return nil, ErrUnsupportedPlatform
+}
+func (s *ObjectStore) LockStagingLifecycle(name string) (*os.File, error) {
+	return nil, ErrUnsupportedPlatform
+}
+func (s *ObjectStore) UnlockStagingLifecycle(f *os.File) error { return nil }
+func (s *ObjectStore) RemoveStaging(name string) error         { return ErrUnsupportedPlatform }

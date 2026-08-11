@@ -215,6 +215,47 @@ func (s *ObjectStore) OpenStaging(name string) (*os.File, error) {
 func (s *ObjectStore) OpenStagingWrite(name string) (*os.File, error) {
 	return s.openStaging(name, unix.O_WRONLY)
 }
+
+// LockStagingLifecycle obtains a per-staging advisory lock. The lock file is
+// distinct from the disposable .part inode, so cleanup retries can serialize
+// even after an earlier attempt unlinked that inode.
+func (s *ObjectStore) LockStagingLifecycle(name string) (*os.File, error) {
+	if !validStagingName(name) {
+		return nil, fmt.Errorf("invalid staging name")
+	}
+	rootFD, err := s.rootFD()
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(rootFD)
+	d, err := openDirectoryAt(rootFD, "staging", true)
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(d)
+	lockName := strings.TrimPrefix(name, "staging/") + ".lock"
+	fd, err := unix.Openat(d, lockName, unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("open staging lifecycle lock: %w", err)
+	}
+	f := os.NewFile(uintptr(fd), "staging/"+lockName)
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("lock staging lifecycle: %w", err)
+	}
+	return f, nil
+}
+func (s *ObjectStore) UnlockStagingLifecycle(f *os.File) error {
+	if f == nil {
+		return nil
+	}
+	lockErr := unix.Flock(int(f.Fd()), unix.LOCK_UN)
+	closeErr := f.Close()
+	if lockErr != nil {
+		return fmt.Errorf("unlock staging lifecycle: %w", lockErr)
+	}
+	return closeErr
+}
 func (s *ObjectStore) openStaging(name string, flags int) (*os.File, error) {
 	if !validStagingName(name) {
 		return nil, fmt.Errorf("invalid staging name")

@@ -13,7 +13,6 @@ import (
 
 	"github.com/example/safefilehub/internal/db"
 	"github.com/example/safefilehub/internal/storage"
-	"golang.org/x/sys/unix"
 )
 
 var ErrOffset = errors.New("upload offset conflict")
@@ -28,6 +27,7 @@ type repository interface {
 	CreateUploadSession(context.Context, db.UploadSession) (db.UploadSession, error)
 	UploadSessionByID(context.Context, string) (db.UploadSession, error)
 	UpdateUploadOffset(context.Context, string, int64, int64) error
+	UpdateUploadStatus(context.Context, string, string, string) error
 	DeleteUploadSession(context.Context, string) error
 }
 type Manager struct {
@@ -58,7 +58,7 @@ func (m *Manager) Create(ctx context.Context, userID, rootID int64, path string,
 	if err = f.Close(); err != nil {
 		return Session{}, err
 	}
-	s, err := m.repo.CreateUploadSession(ctx, db.UploadSession{ID: id, UserID: userID, RootID: rootID, LogicalPath: path, StagingPath: name, Length: length, ExpiresAt: time.Now().Add(m.ttl)})
+	s, err := m.repo.CreateUploadSession(ctx, db.UploadSession{ID: id, UserID: userID, RootID: rootID, LogicalPath: path, StagingPath: name, Length: length, Status: "active", ExpiresAt: time.Now().Add(m.ttl)})
 	if err != nil {
 		_ = m.store.RemoveStaging(name)
 		return Session{}, err
@@ -70,101 +70,121 @@ func (m *Manager) Get(ctx context.Context, id string) (db.UploadSession, error) 
 	if err != nil {
 		return s, err
 	}
-	if !s.ExpiresAt.After(time.Now()) {
-		_ = m.Cancel(ctx, id)
+	if s.Status != "active" || !s.ExpiresAt.After(time.Now()) {
+		_ = m.cleanup(ctx, id, true)
 		return db.UploadSession{}, db.ErrNotFound
 	}
 	return s, nil
 }
-func (m *Manager) Write(ctx context.Context, id string, offset int64, body io.Reader) (int64, error) {
-	lock := m.lock(id)
-	lock.Lock()
-	defer lock.Unlock()
-	// Read just enough to find the staging file. This snapshot is deliberately
-	// not used for validation or writes: another process can commit while this
-	// process waits for the advisory file lock.
-	staging, err := m.repo.UploadSessionByID(ctx, id)
-	if err != nil {
-		return 0, err
-	}
-	f, err := m.store.OpenStagingWrite(staging.StagingPath)
-	if err != nil {
-		return staging.Offset, err
-	}
-	defer f.Close()
-	// The per-process mutex prevents local races; advisory flock extends the
-	// single-writer invariant to independent processes sharing this staging
-	// volume. The CAS remains authoritative for metadata persistence.
-	if err = unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
-		return staging.Offset, fmt.Errorf("lock staging: %w", err)
-	}
-	defer func() { _ = unix.Flock(int(f.Fd()), unix.LOCK_UN) }()
-	// Flock is the cross-process serialization boundary. Refresh all mutable
-	// session fields only after acquiring it, so a writer that waited on the
-	// lock cannot truncate or CAS against a stale offset.
-	s, err := m.repo.UploadSessionByID(ctx, id)
-	if err != nil {
-		return staging.Offset, err
-	}
-	if !s.ExpiresAt.After(time.Now()) {
-		// Preserve Get's expired-session behavior: cleanup is best-effort and
-		// callers observe the session as gone even when cleanup needs a retry.
-		_ = m.cancelLocked(ctx, s)
-		return 0, db.ErrNotFound
-	}
-	if offset != s.Offset {
-		return s.Offset, ErrOffset
-	}
-	// A prior interrupted attempt may have left uncommitted bytes. Normalize
-	// first, then write exactly from the persisted CAS offset.
-	if err = f.Truncate(s.Offset); err != nil {
-		return s.Offset, fmt.Errorf("normalize staging: %w", err)
-	}
-	if _, err = f.Seek(offset, io.SeekStart); err != nil {
-		return s.Offset, err
-	}
-	n, err := io.Copy(f, io.LimitReader(&contextReader{ctx: ctx, r: body}, s.Length-offset+1))
-	if err != nil {
-		_ = f.Truncate(s.Offset)
-		return s.Offset, err
-	}
-	if n > s.Length-offset {
-		_ = f.Truncate(s.Offset)
-		return s.Offset, ErrTooLarge
-	}
-	if err = f.Sync(); err != nil {
-		_ = f.Truncate(s.Offset)
-		return s.Offset, fmt.Errorf("sync staging: %w", err)
-	}
-	if err = m.repo.UpdateUploadOffset(ctx, id, s.Offset, s.Offset+n); err != nil {
-		// The file is the uncommitted side of this operation. Roll it back so a
-		// retry at the persisted offset never skips or duplicates bytes.
-		if rollbackErr := f.Truncate(s.Offset); rollbackErr != nil {
-			return s.Offset, fmt.Errorf("persist offset: %w (rollback staging: %v)", err, rollbackErr)
+
+// withLifecycleLock obtains the flock from a pathname lookup, then re-reads
+// metadata after locking. A changed pathname is never acted on from a stale snapshot.
+func (m *Manager) withLifecycleLock(ctx context.Context, id string, fn func(db.UploadSession) error) error {
+	local := m.lock(id)
+	local.Lock()
+	defer local.Unlock()
+	for {
+		before, err := m.repo.UploadSessionByID(ctx, id)
+		if err != nil {
+			return err
 		}
-		return s.Offset, err
+		f, err := m.store.LockStagingLifecycle(before.StagingPath)
+		if err != nil {
+			return err
+		}
+		s, readErr := m.repo.UploadSessionByID(ctx, id)
+		if readErr != nil {
+			_ = m.store.UnlockStagingLifecycle(f)
+			return readErr
+		}
+		if s.StagingPath != before.StagingPath {
+			_ = m.store.UnlockStagingLifecycle(f)
+			continue
+		}
+		err = fn(s)
+		unlockErr := m.store.UnlockStagingLifecycle(f)
+		if err != nil {
+			return err
+		}
+		return unlockErr
 	}
-	return s.Offset + n, nil
 }
-func (m *Manager) Cancel(ctx context.Context, id string) error {
-	lock := m.lock(id)
-	lock.Lock()
-	defer lock.Unlock()
-	s, err := m.repo.UploadSessionByID(ctx, id)
-	if err != nil {
-		return err
+func (m *Manager) Write(ctx context.Context, id string, offset int64, body io.Reader) (next int64, err error) {
+	err = m.withLifecycleLock(ctx, id, func(s db.UploadSession) error {
+		f, err := m.store.OpenStagingWrite(s.StagingPath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		if s.Status != "active" || !s.ExpiresAt.After(time.Now()) {
+			_ = m.cleanupLocked(ctx, s)
+			return db.ErrNotFound
+		}
+		if offset != s.Offset {
+			next = s.Offset
+			return ErrOffset
+		}
+		if err := f.Truncate(s.Offset); err != nil {
+			return fmt.Errorf("normalize staging: %w", err)
+		}
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			return err
+		}
+		n, copyErr := io.Copy(f, io.LimitReader(&contextReader{ctx: ctx, r: body}, s.Length-offset+1))
+		if copyErr != nil {
+			_ = f.Truncate(s.Offset)
+			return copyErr
+		}
+		if n > s.Length-offset {
+			_ = f.Truncate(s.Offset)
+			return ErrTooLarge
+		}
+		if err := f.Sync(); err != nil {
+			_ = f.Truncate(s.Offset)
+			return fmt.Errorf("sync staging: %w", err)
+		}
+		if err := m.repo.UpdateUploadOffset(ctx, id, s.Offset, s.Offset+n); err != nil {
+			_ = f.Truncate(s.Offset)
+			return err
+		}
+		next = s.Offset + n
+		return nil
+	})
+	return next, err
+}
+func (m *Manager) Cancel(ctx context.Context, id string) error { return m.cleanup(ctx, id, false) }
+func (m *Manager) cleanup(ctx context.Context, id string, expiryOnly bool) error {
+	return m.withLifecycleLock(ctx, id, func(s db.UploadSession) error {
+		// An expiry observer may have read an old row before waiting for flock.
+		// Recheck after the lock so it never deletes a now-live active session.
+		if expiryOnly && s.Status == "active" && s.ExpiresAt.After(time.Now()) {
+			return nil
+		}
+		return m.cleanupLocked(ctx, s)
+	})
+}
+
+// cleanupLocked is idempotent: persist intent before unlink, then delete metadata.
+// cleanup_pending is retained on any failure, so a later Cancel/Get converges.
+func (m *Manager) cleanupLocked(ctx context.Context, s db.UploadSession) error {
+	if s.Status == "complete" {
+		return db.ErrNotFound
 	}
-	return m.cancelLocked(ctx, s)
-}
-func (m *Manager) cancelLocked(ctx context.Context, s db.UploadSession) error {
-	// Delete staging first. On failure leave metadata available for a retry;
-	// deleting metadata first would create an untracked .part file.
+	if s.Status == "active" {
+		if err := m.repo.UpdateUploadStatus(ctx, s.ID, "active", "cancelled"); err != nil {
+			return err
+		}
+		s.Status = "cancelled"
+	}
+	if s.Status == "cancelled" {
+		if err := m.repo.UpdateUploadStatus(ctx, s.ID, "cancelled", "cleanup_pending"); err != nil {
+			return err
+		}
+	}
 	if err := m.store.RemoveStaging(s.StagingPath); err != nil {
 		return err
 	}
 	if err := m.repo.DeleteUploadSession(ctx, s.ID); err != nil {
-		// ENOENT is treated as successful removal, so a retry converges even if
-		// database deletion failed after the file was removed.
 		return err
 	}
 	return nil
