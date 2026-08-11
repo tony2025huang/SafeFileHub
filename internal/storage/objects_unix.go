@@ -5,6 +5,7 @@ package storage
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -297,4 +298,136 @@ func (s *ObjectStore) RemoveStaging(name string) error {
 }
 func validStagingName(name string) bool {
 	return strings.HasPrefix(name, "staging/") && len(strings.TrimPrefix(name, "staging/")) == 37 && strings.HasSuffix(name, ".part") && !strings.Contains(strings.TrimPrefix(name, "staging/"), "/")
+}
+
+// HashAndSyncStaging streams a regular staging file and forces its contents to
+// stable storage before returning its byte count and SHA-256.
+func (s *ObjectStore) HashAndSyncStaging(name string) (int64, [sha256.Size]byte, error) {
+	var sum [sha256.Size]byte
+	f, err := s.OpenStaging(name)
+	if err != nil {
+		return 0, sum, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return 0, sum, fmt.Errorf("stat staging: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return 0, sum, fmt.Errorf("staging is not a regular file")
+	}
+	h := sha256.New()
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return 0, sum, fmt.Errorf("hash staging: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return 0, sum, fmt.Errorf("sync staging: %w", err)
+	}
+	copy(sum[:], h.Sum(nil))
+	return n, sum, nil
+}
+
+// PublishStaging atomically moves a staging inode to a fresh opaque object.
+// All lookups are descriptor relative and use O_NOFOLLOW for directories.
+func (s *ObjectStore) PublishStaging(name string) (string, error) {
+	if !validStagingName(name) {
+		return "", fmt.Errorf("invalid staging name")
+	}
+	rootFD, err := s.rootFD()
+	if err != nil {
+		return "", err
+	}
+	defer unix.Close(rootFD)
+	staging, err := openDirectoryAt(rootFD, "staging", false)
+	if err != nil {
+		return "", err
+	}
+	defer unix.Close(staging)
+	var random [32]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", fmt.Errorf("generate object key: %w", err)
+	}
+	objectName := hex.EncodeToString(random[:])
+	key := "objects/" + objectName[:2] + "/" + objectName
+	objects, shard, err := objectDirectory(rootFD, key, true)
+	if err != nil {
+		return "", err
+	}
+	defer unix.Close(objects)
+	defer unix.Close(shard)
+	if err := unix.Renameat(staging, strings.TrimPrefix(name, "staging/"), shard, objectName); err != nil {
+		return "", fmt.Errorf("publish staging: %w", err)
+	}
+	if err := unix.Fsync(shard); err != nil {
+		return "", fmt.Errorf("sync object directory: %w", err)
+	}
+	if err := unix.Fsync(staging); err != nil {
+		return "", fmt.Errorf("sync staging directory: %w", err)
+	}
+	return key, nil
+}
+
+// StagingNames lists a bounded number of private upload parts for maintenance.
+func (s *ObjectStore) StagingNames(limit int) ([]string, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rootFD, err := s.rootFD()
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(rootFD)
+	d, err := openDirectoryAt(rootFD, "staging", false)
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(d), "staging")
+	defer f.Close()
+	entries, err := f.ReadDir(limit)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if validStagingName("staging/" + entry.Name()) {
+			result = append(result, "staging/"+entry.Name())
+		}
+	}
+	return result, nil
+}
+
+// RestorePublished moves a just-published object back to its staging name after
+// a metadata transaction failure, preserving the active session for retry.
+func (s *ObjectStore) RestorePublished(key, stagingName string) error {
+	if !validStagingName(stagingName) {
+		return fmt.Errorf("invalid staging name")
+	}
+	rootFD, err := s.rootFD()
+	if err != nil {
+		return err
+	}
+	defer unix.Close(rootFD)
+	_, name, err := parseObjectKey(key)
+	if err != nil {
+		return err
+	}
+	objects, shard, err := objectDirectory(rootFD, key, false)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(objects)
+	defer unix.Close(shard)
+	staging, err := openDirectoryAt(rootFD, "staging", true)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(staging)
+	if err := unix.Renameat(shard, name, staging, strings.TrimPrefix(stagingName, "staging/")); err != nil {
+		return fmt.Errorf("restore published staging: %w", err)
+	}
+	if err := unix.Fsync(staging); err != nil {
+		return fmt.Errorf("sync staging directory: %w", err)
+	}
+	return nil
 }

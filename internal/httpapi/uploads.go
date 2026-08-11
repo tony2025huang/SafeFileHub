@@ -26,6 +26,7 @@ type uploadRepository interface {
 	UpdateUploadOffset(context.Context, string, int64, int64) error
 	UpdateUploadStatus(context.Context, string, string, string) error
 	DeleteUploadSession(context.Context, string) error
+	CompleteUpload(context.Context, db.File, string) error
 }
 type uploadAuthorizer interface {
 	Authorize(context.Context, int64, int64, string, string) (bool, error)
@@ -69,6 +70,8 @@ func NewServerWithUploads(cfg config.Config, users authenticator, sessions sessi
 	mux.Handle("HEAD /api/uploads/{id}", state)
 	mux.Handle("DELETE /api/uploads/{id}", state)
 	mux.Handle("PATCH /api/uploads/{id}", patch)
+	complete := requireSession(sessions, http.HandlerFunc(completeUpload(m, authorizer)))
+	mux.Handle("POST /api/uploads/{id}/complete", complete)
 	return RequestLimits(cfg, mux), nil
 }
 func createUpload(m *upload.Manager, repo uploadRepository, a uploadAuthorizer, cfg config.Config) http.HandlerFunc {
@@ -188,5 +191,33 @@ func patchUpload(m *upload.Manager, a uploadAuthorizer) http.HandlerFunc {
 		}
 		w.Header().Set("Upload-Offset", strconv.FormatInt(next, 10))
 		w.WriteHeader(204)
+	}
+}
+
+func completeUpload(m *upload.Manager, a uploadAuthorizer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Completing changes object visibility, so only the owner or a user with
+		// write (administrator) authority may do it.
+		s, ok := sessionFor(r, m, a, "write")
+		if !ok {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		checksum := strings.TrimSpace(r.Header.Get("Upload-Checksum"))
+		checksum = strings.TrimPrefix(strings.ToLower(checksum), "sha256 ")
+		if err := m.Complete(r.Context(), s.ID, checksum); err != nil {
+			switch {
+			case errors.Is(err, upload.ErrIncomplete):
+				http.Error(w, "upload incomplete", http.StatusConflict)
+			case errors.Is(err, upload.ErrChecksum):
+				http.Error(w, "checksum mismatch", http.StatusUnprocessableEntity)
+			case errors.Is(err, db.ErrNotFound), errors.Is(err, db.ErrConflict):
+				http.Error(w, "upload unavailable", http.StatusConflict)
+			default:
+				http.Error(w, "complete upload", http.StatusInternalServerError)
+			}
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	}
 }

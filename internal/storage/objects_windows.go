@@ -4,6 +4,7 @@
 package storage
 
 import (
+	"crypto/sha256"
 	"errors"
 	"io"
 	"os"
@@ -48,3 +49,10 @@ func (s *ObjectStore) LockStagingLifecycle(name string) (*os.File, error) {
 }
 func (s *ObjectStore) UnlockStagingLifecycle(f *os.File) error { return nil }
 func (s *ObjectStore) RemoveStaging(name string) error         { return ErrUnsupportedPlatform }
+
+func (s *ObjectStore) HashAndSyncStaging(name string) (int64, [sha256.Size]byte, error) {
+	return 0, [sha256.Size]byte{}, ErrUnsupportedPlatform
+}
+func (s *ObjectStore) PublishStaging(name string) (string, error)     { return "", ErrUnsupportedPlatform }
+func (s *ObjectStore) StagingNames(limit int) ([]string, error)       { return nil, ErrUnsupportedPlatform }
+func (s *ObjectStore) RestorePublished(key, stagingName string) error { return ErrUnsupportedPlatform }

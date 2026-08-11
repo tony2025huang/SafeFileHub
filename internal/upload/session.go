@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -187,6 +188,11 @@ func (m *Manager) Complete(ctx context.Context, id, expectedSHA256 string) error
 		// Publish precedes metadata. If the DB commit fails, the object is an
 		// unreachable orphan; never a listing-visible half completion.
 		if err := m.repo.CompleteUpload(ctx, db.File{RootID: s.RootID, LogicalPath: s.LogicalPath, ObjectKey: key, Size: s.Length, CreatedByUserID: s.UserID}, s.ID); err != nil {
+			// Do not leave an active row pointing at a vanished part after a DB
+			// failure. Roll the atomic publish back while holding its lifecycle lock.
+			if restoreErr := m.store.RestorePublished(key, s.StagingPath); restoreErr != nil {
+				return fmt.Errorf("complete metadata: %w (restore staging: %v)", err, restoreErr)
+			}
 			return err
 		}
 		return nil
@@ -271,4 +277,56 @@ func (c *contextReader) Read(p []byte) (int, error) {
 	default:
 		return c.r.Read(p)
 	}
+}
+
+// RecoveryReport is the bounded outcome of startup/maintenance reconciliation.
+type RecoveryReport struct{ Checked, Kept, Cancelled, Orphans int }
+
+// Recover reconciles sessions with their private staging files. Valid live
+// sessions survive restarts. Missing or size-inconsistent active parts are
+// transitioned through cleanup, never reported as writable. The scan is
+// bounded and suitable for a background startup job, not a request handler.
+func (m *Manager) Recover(ctx context.Context, limit int, dryRun bool) (RecoveryReport, error) {
+	if limit <= 0 || limit > 64 {
+		limit = 64
+	}
+	names, err := m.store.StagingNames(limit)
+	if err != nil {
+		return RecoveryReport{}, err
+	}
+	report := RecoveryReport{Checked: len(names)}
+	for _, name := range names {
+		id := strings.TrimSuffix(strings.TrimPrefix(name, "staging/"), ".part")
+		s, err := m.repo.UploadSessionByID(ctx, id)
+		if errors.Is(err, db.ErrNotFound) {
+			if !dryRun {
+				if err := m.store.RemoveStaging(name); err != nil {
+					return report, err
+				}
+			}
+			report.Orphans++
+			continue
+		}
+		if err != nil {
+			return report, err
+		}
+		f, err := m.store.OpenStaging(s.StagingPath)
+		valid := err == nil
+		if valid {
+			info, statErr := f.Stat()
+			_ = f.Close()
+			valid = statErr == nil && info.Mode().IsRegular() && info.Size() == s.Offset
+		}
+		if s.Status == "active" && s.ExpiresAt.After(time.Now()) && valid {
+			report.Kept++
+			continue
+		}
+		if !dryRun {
+			if err := m.cleanup(ctx, s.ID, false); err != nil && !errors.Is(err, db.ErrNotFound) {
+				return report, err
+			}
+		}
+		report.Cancelled++
+	}
+	return report, nil
 }

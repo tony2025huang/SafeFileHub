@@ -293,6 +293,40 @@ func (r *Repository) UpdateUploadStatus(ctx context.Context, id, expected, statu
 	return nil
 }
 
+// CompleteUpload records the published object and deletes exactly its active
+// session atomically. Publication has already happened, so metadata can never
+// point at a nonexistent object.
+func (r *Repository) CompleteUpload(ctx context.Context, file File, sessionID string) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin complete upload: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `DELETE FROM upload_sessions WHERE id = ? AND status = 'active'`, sessionID)
+	if err != nil {
+		return fmt.Errorf("delete completed upload session: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("confirm completed upload session: %w", err)
+	}
+	if n != 1 {
+		return ErrConflict
+	}
+	created := utcOrNow(file.CreatedAt)
+	updated := utcOrNow(file.UpdatedAt)
+	if file.UpdatedAt.IsZero() {
+		updated = created
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO files (root_id, logical_path, object_key, size, created_by_user_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, file.RootID, file.LogicalPath, file.ObjectKey, file.Size, file.CreatedByUserID, unixNano(created), unixNano(updated)); err != nil {
+		return classifyError(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit complete upload: %w", err)
+	}
+	return nil
+}
+
 func (r *Repository) DeleteUploadSession(ctx context.Context, id string) error {
 	result, err := r.db.ExecContext(ctx, `DELETE FROM upload_sessions WHERE id = ?`, id)
 	if err != nil {
