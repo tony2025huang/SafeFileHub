@@ -22,9 +22,9 @@ func TestParseCanonicalizesLogicalPaths(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := Parse(tc.raw, config.Default().NamePolicy)
+			got, err := ParseEscapedPath(tc.raw, config.Default().NamePolicy)
 			if err != nil {
-				t.Fatalf("Parse(%q) error = %v", tc.raw, err)
+				t.Fatalf("ParseEscapedPath(%q) error = %v", tc.raw, err)
 			}
 			if got.Canonical != tc.canonical {
 				t.Errorf("Canonical = %q, want %q", got.Canonical, tc.canonical)
@@ -59,8 +59,8 @@ func TestParseRejectsUnsafeLogicalPaths(t *testing.T) {
 
 	for _, raw := range tests {
 		t.Run(raw, func(t *testing.T) {
-			if _, err := Parse(raw, config.Default().NamePolicy); err == nil {
-				t.Fatalf("Parse(%q) succeeded, want error", raw)
+			if _, err := ParseEscapedPath(raw, config.Default().NamePolicy); err == nil {
+				t.Fatalf("ParseEscapedPath(%q) succeeded, want error", raw)
 			}
 		})
 	}
@@ -70,22 +70,43 @@ func TestParseAppliesDefaultFilenamePolicy(t *testing.T) {
 	for _, raw := range []string{
 		".hidden", "~backup", "$tmp", "#draft",
 		"CON", "prn.txt", "aux", "NUL", "COM1", "com9.log", "LPT1", "lpt9.tmp",
+		"KON", "KOM1", "KPT1",
 		"trailing ", "trailing.",
 	} {
 		t.Run(raw, func(t *testing.T) {
-			if _, err := Parse(raw, config.Default().NamePolicy); err == nil {
-				t.Fatalf("Parse(%q) succeeded, want error", raw)
+			if _, err := ParseEscapedPath(raw, config.Default().NamePolicy); err == nil {
+				t.Fatalf("ParseEscapedPath(%q) succeeded, want error", raw)
 			}
 		})
 	}
 }
 
 func TestParseAllowsSafeSpecialAndUnicodeNames(t *testing.T) {
-	got, err := Parse("plus+percent%25-question%3F/%E4%B8%AD%E6%96%87%F0%9F%98%80", config.Default().NamePolicy)
+	got, err := ParseEscapedPath("plus+percent%25-question%3F/%E4%B8%AD%E6%96%87%F0%9F%98%80", config.Default().NamePolicy)
 	if err != nil {
-		t.Fatalf("Parse() error = %v", err)
+		t.Fatalf("ParseEscapedPath() error = %v", err)
 	}
 	if want := "/plus+percent%-question?/中文😀"; got.Canonical != want {
+		t.Fatalf("Canonical = %q, want %q", got.Canonical, want)
+	}
+}
+
+func TestParseDecodedPathAllowsLiteralPercentNames(t *testing.T) {
+	got, err := ParseDecodedPath("reports/100% ready/%2E-not-an-escape", config.Default().NamePolicy)
+	if err != nil {
+		t.Fatalf("ParseDecodedPath() error = %v", err)
+	}
+	if want := "/reports/100% ready/%2E-not-an-escape"; got.Canonical != want {
+		t.Fatalf("Canonical = %q, want %q", got.Canonical, want)
+	}
+}
+
+func TestParseEscapedPathDecodesExactlyOnce(t *testing.T) {
+	got, err := ParseEscapedPath("reports/100%25%20ready", config.Default().NamePolicy)
+	if err != nil {
+		t.Fatalf("ParseEscapedPath() error = %v", err)
+	}
+	if want := "/reports/100% ready"; got.Canonical != want {
 		t.Fatalf("Canonical = %q, want %q", got.Canonical, want)
 	}
 }

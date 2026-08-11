@@ -19,9 +19,14 @@ type Path struct {
 	Segments  []string
 }
 
-// Parse decodes raw exactly once, normalizes valid Unicode to NFC, and returns
-// a canonical logical path. It never maps a logical path to a host path.
-func Parse(raw string, policy config.NamePolicy) (Path, error) {
+// ParseEscapedPath decodes an escaped, relative logical path exactly once,
+// normalizes valid Unicode to NFC, and returns a canonical logical path.
+//
+// Callers that receive an HTTP request must pass r.URL.EscapedPath(), not
+// r.URL.Path: net/http has already decoded URL.Path. For already-decoded input,
+// use ParseDecodedPath instead. Neither function maps a logical path to a host
+// path.
+func ParseEscapedPath(raw string, policy config.NamePolicy) (Path, error) {
 	if raw == "/" {
 		return Path{Canonical: "/"}, nil
 	}
@@ -33,11 +38,35 @@ func Parse(raw string, policy config.NamePolicy) (Path, error) {
 	if err != nil {
 		return Path{}, fmt.Errorf("decode logical path: %w", err)
 	}
-	if !utf8.ValidString(decoded) {
-		return Path{}, fmt.Errorf("logical path is not valid UTF-8")
-	}
 	if containsPercentEscape(decoded) {
 		return Path{}, fmt.Errorf("logical path contains double encoding")
+	}
+	return parseDecodedPath(decoded, policy)
+}
+
+// ParseDecodedPath validates a relative logical path that has already been URL
+// decoded. Literal percent signs, including text such as "%2E", are filenames
+// here and are not decoded again.
+func ParseDecodedPath(decoded string, policy config.NamePolicy) (Path, error) {
+	if decoded == "/" {
+		return Path{Canonical: "/"}, nil
+	}
+	if decoded == "" || strings.HasPrefix(decoded, "/") {
+		return Path{}, fmt.Errorf("logical path must be relative or root")
+	}
+	return parseDecodedPath(decoded, policy)
+}
+
+// Parse is kept for compatibility. New callers must use ParseEscapedPath or
+// ParseDecodedPath to make their URL-decoding boundary explicit.
+// Deprecated: use ParseEscapedPath or ParseDecodedPath.
+func Parse(raw string, policy config.NamePolicy) (Path, error) {
+	return ParseEscapedPath(raw, policy)
+}
+
+func parseDecodedPath(decoded string, policy config.NamePolicy) (Path, error) {
+	if !utf8.ValidString(decoded) {
+		return Path{}, fmt.Errorf("logical path is not valid UTF-8")
 	}
 
 	segments := strings.Split(norm.NFC.String(decoded), "/")
@@ -101,12 +130,23 @@ func isWindowsReservedName(s string) bool {
 	if dot := strings.IndexByte(base, '.'); dot >= 0 {
 		base = base[:dot]
 	}
-	base = strings.ToUpper(base)
-	if base == "CON" || base == "PRN" || base == "AUX" || base == "NUL" {
-		return true
-	}
-	if len(base) == 4 && (strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) {
-		return base[3] >= '1' && base[3] <= '9'
+
+	// Windows device names are case-insensitive. EqualFold applies Unicode case
+	// folding, so compatibility characters such as the Kelvin sign are not able
+	// to evade this check through case conversion.
+	for _, reserved := range []string{
+		"CON", "PRN", "AUX", "NUL",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+		// Conservative aliases for Kelvin-sign case-folding forms. These are
+		// rejected alongside the Windows device namespace to avoid platform
+		// specific interpretation differences.
+		"KON", "KOM1", "KOM2", "KOM3", "KOM4", "KOM5", "KOM6", "KOM7", "KOM8", "KOM9",
+		"KPT1", "KPT2", "KPT3", "KPT4", "KPT5", "KPT6", "KPT7", "KPT8", "KPT9",
+	} {
+		if strings.EqualFold(base, reserved) {
+			return true
+		}
 	}
 	return false
 }
