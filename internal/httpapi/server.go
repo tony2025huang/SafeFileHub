@@ -59,7 +59,7 @@ func NewServerWithAuth(cfg config.Config, users authenticator, sessions sessionM
 	mux.HandleFunc("POST /login", login(users, sessions))
 	mux.HandleFunc("POST /logout", logout(sessions))
 	mux.Handle("GET /session", requireSession(sessions, http.HandlerFunc(sessionStatus)))
-	upload := requireSession(sessions, LimitUpload(limiter, time.Second, sessionUploadIdentity, http.HandlerFunc(uploadPlaceholder)))
+	upload := requireSession(sessions, LimitUpload(limiter, time.Second, sessionUploadIdentity, UploadBodyLimits(cfg.UploadIdleTimeout, 0, http.HandlerFunc(uploadPlaceholder))))
 	mux.Handle("POST /api/uploads", upload)
 	return RequestLimits(cfg, mux), nil
 }
