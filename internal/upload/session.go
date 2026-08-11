@@ -13,6 +13,7 @@ import (
 
 	"github.com/example/safefilehub/internal/db"
 	"github.com/example/safefilehub/internal/storage"
+	"golang.org/x/sys/unix"
 )
 
 var ErrOffset = errors.New("upload offset conflict")
@@ -91,17 +92,40 @@ func (m *Manager) Write(ctx context.Context, id string, offset int64, body io.Re
 		return s.Offset, err
 	}
 	defer f.Close()
+	// The per-process mutex prevents local races; advisory flock extends the
+	// single-writer invariant to independent processes sharing this staging
+	// volume. The CAS remains authoritative for metadata persistence.
+	if err = unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
+		return s.Offset, fmt.Errorf("lock staging: %w", err)
+	}
+	defer func() { _ = unix.Flock(int(f.Fd()), unix.LOCK_UN) }()
+	// A prior interrupted attempt may have left uncommitted bytes. Normalize
+	// first, then write exactly from the persisted CAS offset.
+	if err = f.Truncate(s.Offset); err != nil {
+		return s.Offset, fmt.Errorf("normalize staging: %w", err)
+	}
 	if _, err = f.Seek(offset, io.SeekStart); err != nil {
 		return s.Offset, err
 	}
 	n, err := io.Copy(f, io.LimitReader(&contextReader{ctx: ctx, r: body}, s.Length-offset+1))
 	if err != nil {
+		_ = f.Truncate(s.Offset)
 		return s.Offset, err
 	}
 	if n > s.Length-offset {
+		_ = f.Truncate(s.Offset)
 		return s.Offset, ErrTooLarge
 	}
+	if err = f.Sync(); err != nil {
+		_ = f.Truncate(s.Offset)
+		return s.Offset, fmt.Errorf("sync staging: %w", err)
+	}
 	if err = m.repo.UpdateUploadOffset(ctx, id, s.Offset, s.Offset+n); err != nil {
+		// The file is the uncommitted side of this operation. Roll it back so a
+		// retry at the persisted offset never skips or duplicates bytes.
+		if rollbackErr := f.Truncate(s.Offset); rollbackErr != nil {
+			return s.Offset, fmt.Errorf("persist offset: %w (rollback staging: %v)", err, rollbackErr)
+		}
 		return s.Offset, err
 	}
 	return s.Offset + n, nil
@@ -114,10 +138,17 @@ func (m *Manager) Cancel(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	if err = m.repo.DeleteUploadSession(ctx, id); err != nil {
+	// Delete staging first. On failure leave metadata available for a retry;
+	// deleting metadata first would create an untracked .part file.
+	if err = m.store.RemoveStaging(s.StagingPath); err != nil {
 		return err
 	}
-	return m.store.RemoveStaging(s.StagingPath)
+	if err = m.repo.DeleteUploadSession(ctx, id); err != nil {
+		// ENOENT is treated as successful removal, so a retry converges even if
+		// database deletion failed after the file was removed.
+		return err
+	}
+	return nil
 }
 func (m *Manager) lock(id string) *sync.Mutex {
 	m.mu.Lock()

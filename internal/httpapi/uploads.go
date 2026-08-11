@@ -19,6 +19,7 @@ import (
 
 type uploadRepository interface {
 	StorageRootByID(context.Context, int64) (db.StorageRoot, error)
+	FilesUnderRoot(context.Context, int64) ([]db.File, error)
 	FileByRootAndPath(context.Context, int64, string) (db.File, error)
 	CreateUploadSession(context.Context, db.UploadSession) (db.UploadSession, error)
 	UploadSessionByID(context.Context, string) (db.UploadSession, error)
@@ -57,6 +58,9 @@ func NewServerWithUploads(cfg config.Config, users authenticator, sessions sessi
 	mux.HandleFunc("POST /login", login(users, sessions))
 	mux.HandleFunc("POST /logout", logout(sessions))
 	mux.Handle("GET /session", requireSession(sessions, http.HandlerFunc(sessionStatus)))
+	// The production constructor composes the Task 5 listing surface with
+	// upload endpoints, rather than replacing it with an upload-only mux.
+	mux.Handle("GET /roots/{rootID}/files", requireSession(sessions, listFiles(repo, authorizer, cfg.NamePolicy)))
 	create := requireSession(sessions, http.HandlerFunc(createUpload(m, repo, authorizer, cfg)))
 	mux.Handle("POST /api/uploads", create)
 	state := requireSession(sessions, http.HandlerFunc(uploadState(m, authorizer)))
@@ -111,14 +115,16 @@ func createUpload(m *upload.Manager, repo uploadRepository, a uploadAuthorizer, 
 		_ = json.NewEncoder(w).Encode(uploadResponse{s.ID, cfg.ChunkSize, s.Offset, s.ExpiresAt})
 	}
 }
-func sessionFor(r *http.Request, m *upload.Manager, a uploadAuthorizer) (db.UploadSession, bool) {
+func sessionFor(r *http.Request, m *upload.Manager, a uploadAuthorizer, action string) (db.UploadSession, bool) {
 	s, err := m.Get(r.Context(), r.PathValue("id"))
 	if err != nil {
 		return s, false
 	}
 	uid := r.Context().Value(sessionUserIDKey{}).(int64)
+	// Ownership grants access under the upload-session policy. Collaborators
+	// need the permission matching the requested operation.
 	if uid != s.UserID {
-		ok, e := a.Authorize(r.Context(), uid, s.RootID, s.LogicalPath, "delete")
+		ok, e := a.Authorize(r.Context(), uid, s.RootID, s.LogicalPath, action)
 		if e != nil || !ok {
 			return s, false
 		}
@@ -127,7 +133,11 @@ func sessionFor(r *http.Request, m *upload.Manager, a uploadAuthorizer) (db.Uplo
 }
 func uploadState(m *upload.Manager, a uploadAuthorizer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		s, ok := sessionFor(r, m, a)
+		action := "read"
+		if r.Method == http.MethodDelete {
+			action = "delete"
+		}
+		s, ok := sessionFor(r, m, a, action)
 		if !ok {
 			http.Error(w, "not found", 404)
 			return
@@ -151,7 +161,7 @@ func patchUpload(m *upload.Manager, a uploadAuthorizer) http.HandlerFunc {
 			http.Error(w, "invalid content type", 415)
 			return
 		}
-		s, ok := sessionFor(r, m, a)
+		s, ok := sessionFor(r, m, a, "write")
 		if !ok {
 			http.Error(w, "not found", 404)
 			return

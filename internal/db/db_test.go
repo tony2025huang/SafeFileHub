@@ -170,3 +170,34 @@ func TestMigrationVersionsAreAppliedInOrder(t *testing.T) {
 		t.Fatalf("embedded migration filenames are not sorted: %v", versions)
 	}
 }
+
+func TestUploadLengthMigrationUpgradesExistingSessions(t *testing.T) {
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "legacy.sqlite")
+	database, err := sql.Open("sqlite", sqliteDSN(databasePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = database.ExecContext(ctx, mustReadMigration(t, "001_initial.sql")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = database.ExecContext(ctx, `CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, applied_at INTEGER NOT NULL); INSERT INTO schema_migrations VALUES ('001_initial',0),('002_permission_denies',0); INSERT INTO users (id,username,password_hash,disabled,created_at,updated_at) VALUES (1,'u','x',0,0,0); INSERT INTO storage_roots (id,name,path,created_at,updated_at) VALUES (1,'r','/r',0,0); INSERT INTO upload_sessions (id,user_id,root_id,logical_path,staging_path,offset,expires_at,created_at,updated_at) VALUES ('legacy',1,1,'/a','staging/legacy.part',4,9,1,2);`); err != nil {
+		t.Fatal(err)
+	}
+	if err = database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := Open(ctx, databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	s, err := repo.UploadSessionByID(ctx, "legacy")
+	if err != nil || s.Offset != 4 || s.Length != 0 {
+		t.Fatalf("upgraded session = %#v, %v", s, err)
+	}
+	var indexCount int
+	if err := repo.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_index_list('upload_sessions') WHERE name = 'upload_sessions_expires_idx'").Scan(&indexCount); err != nil || indexCount != 1 {
+		t.Fatalf("expires index = %d, %v", indexCount, err)
+	}
+}

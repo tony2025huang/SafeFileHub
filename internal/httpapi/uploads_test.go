@@ -9,6 +9,7 @@ import (
 	"github.com/example/safefilehub/internal/db"
 	"github.com/example/safefilehub/internal/permission"
 	"github.com/example/safefilehub/internal/storage"
+	"github.com/example/safefilehub/internal/upload"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -85,5 +86,93 @@ func TestUploadLifecycle(t *testing.T) {
 	h.ServeHTTP(dr, del)
 	if dr.Code != 204 {
 		t.Fatalf("delete %d", dr.Code)
+	}
+}
+
+func TestUploadSessionAuthorizationUsesOperationPermission(t *testing.T) {
+	d := t.TempDir()
+	repo, err := db.Open(context.Background(), d+"/db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	owner, _ := repo.CreateUser(context.Background(), db.User{Username: "owner", PasswordHash: "x"})
+	readOnly, _ := repo.CreateUser(context.Background(), db.User{Username: "read", PasswordHash: "x"})
+	writeOnly, _ := repo.CreateUser(context.Background(), db.User{Username: "write", PasswordHash: "x"})
+	deleteOnly, _ := repo.CreateUser(context.Background(), db.User{Username: "delete", PasswordHash: "x"})
+	root, _ := repo.CreateStorageRoot(context.Background(), db.StorageRoot{Name: "r", Path: d})
+	for _, p := range []db.Permission{{UserID: readOnly.ID, RootID: root.ID, PathPrefix: "/", Action: "read", Allow: true}, {UserID: writeOnly.ID, RootID: root.ID, PathPrefix: "/", Action: "write", Allow: true}, {UserID: deleteOnly.ID, RootID: root.ID, PathPrefix: "/", Action: "delete", Allow: true}} {
+		_, _ = repo.CreatePermission(context.Background(), p)
+	}
+	store, _ := storage.NewObjectStore(d)
+	defer store.Close()
+	sessions := auth.NewSessionManager(auth.NewMemorySessionStore(), auth.SessionConfig{TTL: time.Hour})
+	defer sessions.Close()
+	h, err := NewServerWithUploads(config.Default(), rejectingAuthenticator{}, sessions, repo, permission.NewAuthorizer(repo, config.Default().NamePolicy), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := upload.New(repo, store, config.Default().ChunkSize, time.Hour)
+	s, err := m.Create(context.Background(), owner.ID, root.ID, "/a", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := func(user int64, method string) int {
+		sid, _ := sessions.Create(context.Background(), user)
+		req := httptest.NewRequest(method, "/api/uploads/"+s.ID, bytes.NewBufferString("x"))
+		req.AddCookie(&http.Cookie{Name: sessions.CookieName(), Value: sid})
+		if method == http.MethodPatch {
+			req.Header.Set("Content-Type", "application/offset+octet-stream")
+			req.Header.Set("Upload-Offset", "0")
+		}
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		return rr.Code
+	}
+	if got := request(readOnly.ID, http.MethodHead); got != 200 {
+		t.Fatalf("read HEAD = %d", got)
+	}
+	if got := request(readOnly.ID, http.MethodPatch); got != 404 {
+		t.Fatalf("read PATCH = %d", got)
+	}
+	if got := request(writeOnly.ID, http.MethodHead); got != 404 {
+		t.Fatalf("write HEAD = %d", got)
+	}
+	if got := request(writeOnly.ID, http.MethodPatch); got != 204 {
+		t.Fatalf("write PATCH = %d", got)
+	}
+	if got := request(deleteOnly.ID, http.MethodHead); got != 404 {
+		t.Fatalf("delete HEAD = %d", got)
+	}
+	if got := request(deleteOnly.ID, http.MethodDelete); got != 204 {
+		t.Fatalf("delete DELETE = %d", got)
+	}
+}
+
+func TestNewServerWithUploadsRetainsFileListingRoute(t *testing.T) {
+	d := t.TempDir()
+	repo, err := db.Open(context.Background(), d+"/db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	u, _ := repo.CreateUser(context.Background(), db.User{Username: "u", PasswordHash: "x"})
+	root, _ := repo.CreateStorageRoot(context.Background(), db.StorageRoot{Name: "r", Path: d})
+	_, _ = repo.CreatePermission(context.Background(), db.Permission{UserID: u.ID, RootID: root.ID, PathPrefix: "/", Action: "read", Allow: true})
+	store, _ := storage.NewObjectStore(d)
+	defer store.Close()
+	sessions := auth.NewSessionManager(auth.NewMemorySessionStore(), auth.SessionConfig{TTL: time.Hour})
+	defer sessions.Close()
+	sid, _ := sessions.Create(context.Background(), u.ID)
+	h, err := NewServerWithUploads(config.Default(), rejectingAuthenticator{}, sessions, repo, permission.NewAuthorizer(repo, config.Default().NamePolicy), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/roots/1/files?path=/", nil)
+	req.AddCookie(&http.Cookie{Name: sessions.CookieName(), Value: sid})
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("listing route = %d: %s", rr.Code, rr.Body.String())
 	}
 }
