@@ -58,7 +58,17 @@ go test ./... -bench . -benchmem
 
 不要在测试或日志中输出密码、session secret、请求 body、文件内容或 token。benchmark 只应使用本地/隔离环境中的临时数据。
 
-## Docker 部署
+## 生产部署
+
+生产环境必须使用持久化的宿主机 filesystem，不要使用 `tmpfs`。建议将宿主机目录设为 `/var/lib/safefilehub/data`；它包含 SQLite 数据库、objects、`staging` 和 archive artifacts。`data/staging` 必须与 data 中的对象存储位于**同一文件系统**，因为上传完成依赖 atomic rename。SQLite WAL 还需要稳定、可写并支持文件锁的目录。
+
+创建目录后，应由运行服务的非 root 用户拥有，并限制权限：
+
+```sh
+install -d -o safefilehub -g safefilehub -m 0700 /var/lib/safefilehub/data
+```
+
+### Docker
 
 构建镜像：
 
@@ -66,29 +76,120 @@ go test ./... -bench . -benchmem
 docker build -t safefilehub:test .
 ```
 
-建议使用只读 root，并挂载一个可写 data volume：
+生产运行示例（将服务仅发布到本机，由反向代理访问）：
 
 ```sh
-docker run --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m \
-  --mount type=volume,src=safefilehub-data,dst=/var/lib/safefilehub/data \
-  -p 127.0.0.1:8080:8080 safefilehub:test
+docker run -d --name safefilehub --restart unless-stopped \
+  --read-only \
+  --mount type=bind,src=/var/lib/safefilehub/data,dst=/var/lib/safefilehub/data \
+  -p 127.0.0.1:8080:8080 \
+  safefilehub:test
 ```
 
-镜像工作目录是 `/var/lib/safefilehub`，默认 data 路径为 `/var/lib/safefilehub/data`，其中包含 objects、staging、archive artifacts 和 `safefilehub.db`。**不要把 staging 单独挂载到其他文件系统**：上传完成依赖同一文件系统上的 atomic rename。SQLite WAL 需要稳定、可写并支持文件锁的 data volume；不建议使用受限 tmpfs 作为生产数据库目录。
+镜像工作目录是 `/var/lib/safefilehub`，默认 data 路径为 `/var/lib/safefilehub/data`。以上命令不使用 `tmpfs`；持久化 bind mount 同时保存数据库、对象、`staging` 和归档产物。若改用 Docker named volume，也必须只将整个 data 目录挂载为一个稳定的、支持 SQLite 文件锁的 volume，不能把 `staging` 挂载到另一文件系统。
 
-systemd 可参考 `deploy/safefilehub.service.example`，运维细节见 `docs/operations.md`。
+### systemd
 
-## TLS、反向代理与运维
+以 `deploy/safefilehub.service.example` 为基础：复制到 `/etc/systemd/system/safefilehub.service`，按注释设置二进制路径、`User`/`Group`，并保持 `WorkingDirectory=/var/lib/safefilehub`、`ReadWritePaths=/var/lib/safefilehub/data` 与该持久化 data 目录一致。示例已通过 `-recover-on-start=true` 启动服务。随后执行：
 
-不要将服务直接暴露到互联网。应放在 TLS-terminating reverse proxy 后面，在代理层和应用层同时限制 request body，只有可信代理才能传递 client IP，后端监听限制在私有接口。生产环境应监控文件描述符、磁盘空间、RSS、延迟、429/503、取消和 staging cleanup 指标。
+```sh
+systemctl daemon-reload
+systemctl enable --now safefilehub
+systemctl status safefilehub
+```
 
-备份时同时考虑 SQLite 数据库和对象 data；恢复后先执行一致性检查。发布前保留旧镜像和配置以便 rollback；清理 staging 时只删除过期、取消或确认 orphan 的临时文件，不能删除活跃 session。
+运维恢复、备份和回滚细节见 `docs/operations.md`。
+
+## Nginx HTTPS reverse proxy
+
+不要将服务直接暴露到互联网。将 SafeFileHub 绑定到 `127.0.0.1:8080`（Docker 示例通过端口映射实现），并在 Nginx 终止 TLS。当前 HTTP 路由没有 WebSocket endpoint，因此配置中不添加 WebSocket upgrade headers。
+
+以下为一个站点配置示例；替换域名与证书路径占位符：
+
+```nginx
+upstream safefilehub {
+    server 127.0.0.1:8080;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name files.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name files.example.com;
+
+    ssl_certificate     /path/to/fullchain.pem;
+    ssl_certificate_key /path/to/privkey.pem;
+
+    access_log /var/log/nginx/safefilehub.access.log;
+    error_log  /var/log/nginx/safefilehub.error.log warn;
+
+    # Match the application's per-PATCH maximum request body (64 MiB).
+    client_max_body_size 64m;
+    # The application permits 30 minutes of inactivity while receiving an upload.
+    client_body_timeout 30m;
+
+    location / {
+        proxy_pass http://safefilehub;
+        proxy_http_version 1.1;
+        # Stream resumable upload PATCH bodies instead of buffering them on Nginx disk.
+        proxy_request_buffering off;
+        proxy_read_timeout 30m;
+        proxy_send_timeout 30m;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+    }
+}
+```
+
+SafeFileHub 当前仍以 socket peer address 识别客户端，未配置 trusted-proxy support；因此它不会使用上述 `X-Forwarded-*` 头部来决定 client IP。只允许可信代理连接后端。
+
+## 初始管理员与密码
+
+代码中没有默认用户名或默认密码。当前生产入口也没有 CLI、环境变量或无需认证的 API 来创建第一个用户；`POST /api/admin/users` 只能由已有 session 且用户名已列在 `config.Config.AdminUsernames` 中的管理员调用。默认 `AdminUsernames` 为空，且 `cmd/safefilehub/main.go` 直接使用 `config.Default()`，没有提供设置该 bootstrap 列表的运行时配置接口。
+
+因此，**首次管理员初始化目前是部署缺口**：不能按 README 编造一个可用的首建命令或 API。上线前应补充并审计一个受控 bootstrap 机制；在此之前，空数据库不能通过当前公开 CLI/API 完成首次管理员创建。后续管理员创建接口实际为 `POST /api/admin/users`，JSON 字段为 `{"username":"...","password":"..."}`；密码重置为 `PUT /api/admin/users/{userID}/password`，JSON 字段为 `{"password":"..."}`，两者都需要已认证管理员。
+
+部署实现 bootstrap 后，使用安全随机、仅一次传递的初始密码，例如：
+
+```sh
+openssl rand -base64 32
+```
+
+不要把密码写入 systemd unit、shell history、镜像、日志或版本库。首次登录后立即通过受控管理员流程重置初始密码，并按最小权限创建其他用户与 scoped permissions。
+
+## 日志与运维
+
+应用当前没有独立文件日志：它使用 Go 标准日志写入 stdout/stderr。使用 systemd 时通过以下命令查看：
+
+```sh
+journalctl -u safefilehub
+```
+
+使用 Docker 时查看容器 stdout/stderr：
+
+```sh
+docker logs safefilehub
+```
+
+Docker 默认 `json-file` logging driver 的宿主机日志文件通常是 `/var/lib/docker/containers/<container-id>/<container-id>-json.log`；该路径由 Docker daemon 的 data root 和 logging driver 配置决定，不能假定所有部署均相同。以 `docker inspect -f '{{.LogPath}}' safefilehub` 或实际 daemon 配置为准，生产环境应配置日志轮转。Nginx access/error log 建议分别使用 `/var/log/nginx/safefilehub.access.log` 和 `/var/log/nginx/safefilehub.error.log`，如上例所示。
+
+生产环境应监控文件描述符、磁盘空间、RSS、延迟、429/503、取消和 staging cleanup 指标。备份时同时考虑 SQLite 数据库和对象 data；恢复后先执行一致性检查。发布前保留旧镜像和配置以便 rollback；清理 staging 时只删除过期、取消或确认 orphan 的临时文件，不能删除活跃 session。
 
 ## Benchmark 与已知限制
 
 `bench/` 提供有界并发和健康响应 guard，`docs/benchmarks/2026-08-11-baseline.md` 记录本地可复现 baseline。当前结果不是跨网络吞吐承诺；没有隔离 `iperf3` 对端时，不应声称网络优化结论。不要自动修改宿主机 sysctl，也不要在没有数据支持时宣称增加并行度一定提升吞吐。
 
-已知环境限制：Docker daemon 的 layer cache/storage 异常可能在镜像 export 阶段报 `snapshot parent missing`；这不是应用编译错误。只读 root 配合受限 tmpfs data 可能使 SQLite WAL 报 `unable to open database file: out of memory (14)`，生产应使用标准可写 data volume。
+已知环境限制：Docker daemon 的 layer cache/storage 异常可能在镜像 export 阶段报 `snapshot parent missing`；这不是应用编译错误。生产 data 目录必须是持久化、可写并支持 SQLite 文件锁的 filesystem。
 
 ## 许可证与贡献
 
