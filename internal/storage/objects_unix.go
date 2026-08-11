@@ -73,6 +73,15 @@ func (s *ObjectStore) rootFD() (int, error) {
 	return unix.Dup(s.fd)
 }
 
+// Check is a constant-cost readiness probe; it never enumerates directories.
+func (s *ObjectStore) Check() error {
+	fd, err := s.rootFD()
+	if err != nil {
+		return err
+	}
+	return unix.Close(fd)
+}
+
 // Create creates a new completed object. logicalPath is deliberately not used
 // in choosing its physical name; its validation belongs to the request layer.
 func (s *ObjectStore) Create(logicalPath string) (string, io.WriteCloser, error) {

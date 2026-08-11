@@ -28,12 +28,11 @@ Build locally:
 docker build -t safefilehub:test .
 ```
 
-Run with a read-only root filesystem and **two independent writable mounts**. The current configuration defaults to `data` for storage and SQLite; set deployment configuration so the application's storage root and SQLite path both point to the appropriate mounted paths. Keep staging on the same filesystem as object storage when atomic rename is required.
+Run with a read-only root filesystem and **one writable data mount**. The image `WORKDIR` is `/var/lib/safefilehub`, so defaults resolve to `/var/lib/safefilehub/data` (objects, `staging`, archive artifacts, and `safefilehub.db`). Staging intentionally remains below the storage root because atomic upload publication requires the same filesystem.
 
 ```sh
 docker run --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m \
   --mount type=volume,src=safefilehub-data,dst=/var/lib/safefilehub/data \
-  --mount type=volume,src=safefilehub-staging,dst=/var/lib/safefilehub/staging \
   -p 127.0.0.1:8080:8080 safefilehub:test
 ```
 
@@ -42,7 +41,7 @@ Do not expose the service directly to the internet. Put it behind a TLS-terminat
 ## Operations
 
 - `GET /healthz` is a shallow liveness response; it does not scan storage.
-- `GET /readyz` is available in the observability composition and reports database, storage, or disk dependency failure.
+- `GET /readyz` is is part of the production composition root and performs constant-cost database, retained-storage-descriptor, and storage-path checks; it does not scan directories.
 - `GET /metrics` exports bounded-label counters. Do not add user paths, contents, passwords, or tokens as labels/log fields.
 - Use `deploy/safefilehub.service.example` as a hardened systemd starting point.
 

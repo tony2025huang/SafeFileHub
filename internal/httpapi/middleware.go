@@ -85,7 +85,7 @@ type connectionKey struct{}
 
 func ServerTimeouts(cfg config.Config, handler http.Handler) *http.Server {
 	return &http.Server{
-		Addr: cfg.ListenAddr, Handler: RequestLimits(cfg, handler), ReadHeaderTimeout: cfg.ReadHeaderTimeout, ReadTimeout: cfg.ReadTimeout, WriteTimeout: cfg.WriteTimeout, IdleTimeout: cfg.IdleTimeout,
+		Addr: cfg.ListenAddr, Handler: handler, ReadHeaderTimeout: cfg.ReadHeaderTimeout, ReadTimeout: cfg.ReadTimeout, WriteTimeout: cfg.WriteTimeout, IdleTimeout: cfg.IdleTimeout,
 		ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
 			return context.WithValue(ctx, connectionKey{}, conn)
 		},

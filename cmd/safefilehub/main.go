@@ -11,7 +11,9 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
+	"github.com/example/safefilehub/internal/archive"
 	"github.com/example/safefilehub/internal/auth"
 	"github.com/example/safefilehub/internal/config"
 	"github.com/example/safefilehub/internal/db"
@@ -128,7 +130,13 @@ func runWithLifecycle(lifecycle context.Context, args []string, cfg config.Confi
 		return nil
 	}
 
-	h, err := httpapi.NewServerWithUploadsAndObservability(cfg, auth.NewService(repo), sessions, repo, permission.NewAuthorizer(repo, cfg.NamePolicy), store, observability, limiter)
+	archiveManager, err := archive.New(archive.Options{Workers: 2, MaxFiles: 1000, MaxBytes: 1 << 30, TTL: time.Hour, TempDir: cfg.StorageRoot + "/archives"}, httpapi.ObjectArchiveSource{Store: store})
+	if err != nil {
+		return err
+	}
+	defer archiveManager.Close()
+
+	h, err := httpapi.NewProductionServer(cfg, auth.NewService(repo), sessions, repo, permission.NewAuthorizer(repo, cfg.NamePolicy), store, archiveManager, httpapi.ProductionReadiness{DB: repo, ObjectStore: store, StoragePath: cfg.StorageRoot}, observability, limiter)
 	if err != nil {
 		return err
 	}

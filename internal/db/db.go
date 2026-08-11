@@ -133,3 +133,6 @@ func embeddedMigrations() ([]migration, error) {
 func (r *Repository) Close() error {
 	return r.db.Close()
 }
+
+// PingContext is a constant-cost database readiness probe.
+func (r *Repository) PingContext(ctx context.Context) error { return r.db.PingContext(ctx) }

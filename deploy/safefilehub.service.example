@@ -1,5 +1,5 @@
 # Copy to /etc/systemd/system/safefilehub.service after setting paths/user.
-# Keep data and staging on the same filesystem if atomic upload publication is required.
+# data contains SQLite, objects, staging, and archive artifacts; keep it on one filesystem for atomic publication.
 [Unit]
 Description=SafeFileHub
 After=network-online.target
@@ -17,7 +17,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/lib/safefilehub/data /var/lib/safefilehub/staging
+ReadWritePaths=/var/lib/safefilehub/data
 LimitNOFILE=65536
 UMask=0077
 # Supply application configuration using the approved deployment mechanism;

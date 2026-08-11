@@ -11,9 +11,10 @@ RUN addgroup -S safefilehub && adduser -S -G safefilehub -h /var/lib/safefilehub
     && mkdir -p /var/lib/safefilehub/data /var/lib/safefilehub/staging \
     && chown -R safefilehub:safefilehub /var/lib/safefilehub
 COPY --from=build /out/safefilehub /usr/local/bin/safefilehub
+WORKDIR /var/lib/safefilehub
 USER safefilehub:safefilehub
 EXPOSE 8080
-# Run with --read-only. data (SQLite/objects) and staging are deliberately
-# separate writable mounts so staging cleanup cannot affect completed objects.
-VOLUME ["/var/lib/safefilehub/data", "/var/lib/safefilehub/staging"]
+# Default relative paths resolve from /var/lib/safefilehub: data contains SQLite, objects, staging, and archive artifacts.
+# Staging remains under data because atomic publication requires one filesystem.
+VOLUME ["/var/lib/safefilehub/data"]
 ENTRYPOINT ["/usr/local/bin/safefilehub"]
