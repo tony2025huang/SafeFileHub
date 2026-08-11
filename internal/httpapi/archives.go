@@ -12,6 +12,7 @@ import (
 	"github.com/example/safefilehub/internal/archive"
 	"github.com/example/safefilehub/internal/config"
 	"github.com/example/safefilehub/internal/db"
+	"github.com/example/safefilehub/internal/metrics"
 	"github.com/example/safefilehub/internal/pathpolicy"
 )
 
@@ -26,6 +27,19 @@ type archiveAuthorizer interface {
 // NewServerWithArchives provides job-based archive downloads. Artifacts are
 // private temporary files owned by archive.Manager and are never persisted as files.
 func NewServerWithArchives(cfg config.Config, users authenticator, sessions sessionManager, repo archiveRepository, authorizer archiveAuthorizer, manager *archive.Manager) (http.Handler, error) {
+	return newServerWithArchives(cfg, users, sessions, repo, authorizer, manager, nil)
+}
+
+// NewServerWithArchivesAndObservability preserves NewServerWithArchives's API
+// and uses a caller-owned Metrics instance for archive work and responses.
+func NewServerWithArchivesAndObservability(cfg config.Config, users authenticator, sessions sessionManager, repo archiveRepository, authorizer archiveAuthorizer, manager *archive.Manager, observability *metrics.Metrics) (http.Handler, error) {
+	if observability == nil {
+		return nil, errors.New("observability dependencies are required")
+	}
+	return newServerWithArchives(cfg, users, sessions, repo, authorizer, manager, observability)
+}
+
+func newServerWithArchives(cfg config.Config, users authenticator, sessions sessionManager, repo archiveRepository, authorizer archiveAuthorizer, manager *archive.Manager, observability *metrics.Metrics) (http.Handler, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -36,9 +50,22 @@ func NewServerWithArchives(cfg config.Config, users authenticator, sessions sess
 	m.HandleFunc("GET /healthz", healthz)
 	m.HandleFunc("POST /login", login(users, sessions))
 	m.HandleFunc("POST /logout", logout(sessions))
-	m.Handle("POST /api/roots/{rootID}/archives", requireSession(sessions, http.HandlerFunc(createArchive(repo, authorizer, manager, cfg.NamePolicy))))
-	m.Handle("GET /api/archives/{jobID}", requireSession(sessions, http.HandlerFunc(downloadArchive(manager))))
-	m.Handle("DELETE /api/archives/{jobID}", requireSession(sessions, http.HandlerFunc(cancelArchive(manager))))
+	create := http.Handler(http.HandlerFunc(createArchive(repo, authorizer, manager, cfg.NamePolicy)))
+	download := http.Handler(http.HandlerFunc(downloadArchive(manager)))
+	if observability != nil {
+		create = observeArchive(observability, create)
+		download = observeArchive(observability, download)
+	}
+	m.Handle("POST /api/roots/{rootID}/archives", requireSession(sessions, create))
+	m.Handle("GET /api/archives/{jobID}", requireSession(sessions, download))
+	cancel := http.Handler(http.HandlerFunc(cancelArchive(manager)))
+	if observability != nil {
+		cancel = observeCancellation(observability, cancel)
+	}
+	m.Handle("DELETE /api/archives/{jobID}", requireSession(sessions, cancel))
+	if observability != nil {
+		return observedHandler(cfg, m, observability), nil
+	}
 	return RequestLimits(cfg, m), nil
 }
 func createArchive(repo archiveRepository, auth archiveAuthorizer, manager *archive.Manager, policy config.NamePolicy) http.HandlerFunc {

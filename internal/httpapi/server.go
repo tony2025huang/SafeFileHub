@@ -50,11 +50,7 @@ func NewServerWithObservability(cfg config.Config, checks ReadinessChecks, m *me
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthz)
 	mux.HandleFunc("GET /readyz", readyz(checks))
-	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-		_, _ = w.Write([]byte(m.Prometheus()))
-	})
-	return RequestLimits(cfg, metricResponses(m, mux)), nil
+	return observedHandler(cfg, mux, m), nil
 }
 
 type authenticator interface {
@@ -91,6 +87,32 @@ func NewServerWithAuth(cfg config.Config, users authenticator, sessions sessionM
 	upload := requireSession(sessions, LimitUpload(limiter, time.Second, sessionUploadIdentity, UploadBodyLimits(cfg.UploadIdleTimeout, 0, http.HandlerFunc(uploadPlaceholder))))
 	mux.Handle("POST /api/uploads", upload)
 	return RequestLimits(cfg, mux), nil
+}
+
+// NewServerWithAuthAndObservability preserves NewServerWithAuth's API while
+// allowing a composed deployment to use one caller-owned Metrics instance.
+func NewServerWithAuthAndObservability(cfg config.Config, users authenticator, sessions sessionManager, m *metrics.Metrics, suppliedLimiter ...*limits.UploadLimiter) (http.Handler, error) {
+	if m == nil {
+		return nil, errors.New("observability dependencies are required")
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("validate server configuration: %w", err)
+	}
+	if users == nil || sessions == nil {
+		return nil, errors.New("authentication dependencies are required")
+	}
+	limiter, err := newUploadLimiter(cfg, suppliedLimiter)
+	if err != nil {
+		return nil, err
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", healthz)
+	mux.HandleFunc("POST /login", login(users, sessions))
+	mux.HandleFunc("POST /logout", logout(sessions))
+	mux.Handle("GET /session", requireSession(sessions, http.HandlerFunc(sessionStatus)))
+	upload := requireSession(sessions, observeUpload(m, limitUploadWithMetrics(limiter, time.Second, sessionUploadIdentity, m, UploadBodyLimits(cfg.UploadIdleTimeout, 0, http.HandlerFunc(uploadPlaceholder)))))
+	mux.Handle("POST /api/uploads", upload)
+	return observedHandler(cfg, mux, m), nil
 }
 
 func newUploadLimiter(cfg config.Config, supplied []*limits.UploadLimiter) (*limits.UploadLimiter, error) {

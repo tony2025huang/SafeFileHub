@@ -17,6 +17,7 @@ import (
 	"github.com/example/safefilehub/internal/db"
 	"github.com/example/safefilehub/internal/download"
 	"github.com/example/safefilehub/internal/limits"
+	"github.com/example/safefilehub/internal/metrics"
 	"github.com/example/safefilehub/internal/storage"
 )
 
@@ -32,6 +33,19 @@ type downloadAuthorizer interface {
 // with a single-object download route. Multi-range requests are deliberately
 // rejected (416), avoiding multipart buffering and ambiguity.
 func NewServerWithDownloads(cfg config.Config, users authenticator, sessions sessionManager, repo downloadRepository, authorizer downloadAuthorizer, store *storage.ObjectStore) (http.Handler, error) {
+	return newServerWithDownloads(cfg, users, sessions, repo, authorizer, store, nil)
+}
+
+// NewServerWithDownloadsAndObservability preserves NewServerWithDownloads's
+// API and uses one caller-owned Metrics instance for the composed service.
+func NewServerWithDownloadsAndObservability(cfg config.Config, users authenticator, sessions sessionManager, repo downloadRepository, authorizer downloadAuthorizer, store *storage.ObjectStore, observability *metrics.Metrics) (http.Handler, error) {
+	if observability == nil {
+		return nil, errors.New("observability dependencies are required")
+	}
+	return newServerWithDownloads(cfg, users, sessions, repo, authorizer, store, observability)
+}
+
+func newServerWithDownloads(cfg config.Config, users authenticator, sessions sessionManager, repo downloadRepository, authorizer downloadAuthorizer, store *storage.ObjectStore, observability *metrics.Metrics) (http.Handler, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -47,9 +61,18 @@ func NewServerWithDownloads(cfg config.Config, users authenticator, sessions ses
 	m.HandleFunc("POST /login", login(users, sessions))
 	m.HandleFunc("POST /logout", logout(sessions))
 	m.Handle("GET /session", requireSession(sessions, http.HandlerFunc(sessionStatus)))
-	downloadHandler := requireSession(sessions, limitDownload(limiter, http.HandlerFunc(downloadFile(repo, authorizer, store))))
+	download := http.Handler(http.HandlerFunc(downloadFile(repo, authorizer, store)))
+	if observability != nil {
+		download = limitDownloadWithMetrics(limiter, observability, observeDownload(observability, download))
+	} else {
+		download = limitDownload(limiter, download)
+	}
+	downloadHandler := requireSession(sessions, download)
 	m.Handle("GET /api/files/{fileID}", downloadHandler)
 	m.Handle("HEAD /api/files/{fileID}", downloadHandler)
+	if observability != nil {
+		return observedHandler(cfg, m, observability), nil
+	}
 	return RequestLimits(cfg, m), nil
 }
 

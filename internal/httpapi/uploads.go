@@ -8,6 +8,7 @@ import (
 	"github.com/example/safefilehub/internal/config"
 	"github.com/example/safefilehub/internal/db"
 	"github.com/example/safefilehub/internal/limits"
+	"github.com/example/safefilehub/internal/metrics"
 	"github.com/example/safefilehub/internal/pathpolicy"
 	"github.com/example/safefilehub/internal/storage"
 	"github.com/example/safefilehub/internal/upload"
@@ -46,6 +47,19 @@ type uploadResponse struct {
 }
 
 func NewServerWithUploads(cfg config.Config, users authenticator, sessions sessionManager, repo uploadRepository, authorizer uploadAuthorizer, store *storage.ObjectStore, supplied ...*limits.UploadLimiter) (http.Handler, error) {
+	return newServerWithUploads(cfg, users, sessions, repo, authorizer, store, nil, supplied...)
+}
+
+// NewServerWithUploadsAndObservability preserves NewServerWithUploads's API
+// and makes the caller-owned Metrics instance available to every transfer route.
+func NewServerWithUploadsAndObservability(cfg config.Config, users authenticator, sessions sessionManager, repo uploadRepository, authorizer uploadAuthorizer, store *storage.ObjectStore, m *metrics.Metrics, supplied ...*limits.UploadLimiter) (http.Handler, error) {
+	if m == nil {
+		return nil, errors.New("observability dependencies are required")
+	}
+	return newServerWithUploads(cfg, users, sessions, repo, authorizer, store, m, supplied...)
+}
+
+func newServerWithUploads(cfg config.Config, users authenticator, sessions sessionManager, repo uploadRepository, authorizer uploadAuthorizer, store *storage.ObjectStore, observability *metrics.Metrics, supplied ...*limits.UploadLimiter) (http.Handler, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -68,13 +82,22 @@ func NewServerWithUploads(cfg config.Config, users authenticator, sessions sessi
 	mux.Handle("GET /roots/{rootID}/files", requireSession(sessions, listFiles(repo, authorizer, cfg.NamePolicy)))
 	create := requireSession(sessions, http.HandlerFunc(createUpload(m, repo, authorizer, cfg)))
 	mux.Handle("POST /api/uploads", create)
-	state := requireSession(sessions, http.HandlerFunc(uploadState(m, authorizer)))
-	patch := requireSession(sessions, LimitUpload(limiter, time.Second, sessionUploadIdentity, UploadBodyLimits(cfg.UploadIdleTimeout, cfg.MaxRequestBodyBytes, http.HandlerFunc(patchUpload(m, authorizer)))))
+	state := requireSession(sessions, http.HandlerFunc(uploadStateWithMetrics(m, authorizer, observability)))
+	patchHandler := http.Handler(UploadBodyLimits(cfg.UploadIdleTimeout, cfg.MaxRequestBodyBytes, http.HandlerFunc(patchUpload(m, authorizer))))
+	if observability != nil {
+		patchHandler = limitUploadWithMetrics(limiter, time.Second, sessionUploadIdentity, observability, observeUpload(observability, patchHandler))
+	} else {
+		patchHandler = LimitUpload(limiter, time.Second, sessionUploadIdentity, patchHandler)
+	}
+	patch := requireSession(sessions, patchHandler)
 	mux.Handle("HEAD /api/uploads/{id}", state)
 	mux.Handle("DELETE /api/uploads/{id}", state)
 	mux.Handle("PATCH /api/uploads/{id}", patch)
 	complete := requireSession(sessions, http.HandlerFunc(completeUpload(m, authorizer)))
 	mux.Handle("POST /api/uploads/{id}/complete", complete)
+	if observability != nil {
+		return observedHandler(cfg, mux, observability), nil
+	}
 	return RequestLimits(cfg, mux), nil
 }
 func createUpload(m *upload.Manager, repo uploadRepository, a uploadAuthorizer, cfg config.Config) http.HandlerFunc {
@@ -144,6 +167,10 @@ func sessionFor(r *http.Request, m *upload.Manager, a uploadAuthorizer, action s
 	return s, true
 }
 func uploadState(m *upload.Manager, a uploadAuthorizer) http.HandlerFunc {
+	return uploadStateWithMetrics(m, a, nil)
+}
+
+func uploadStateWithMetrics(m *upload.Manager, a uploadAuthorizer, observability *metrics.Metrics) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		action := "read"
 		if r.Method == http.MethodDelete {
@@ -158,6 +185,10 @@ func uploadState(m *upload.Manager, a uploadAuthorizer) http.HandlerFunc {
 			if err := m.Cancel(r.Context(), s.ID); err != nil {
 				http.Error(w, "cancel upload", 500)
 				return
+			}
+			if observability != nil {
+				observability.IncCancellation()
+				observability.IncCleanup()
 			}
 			w.WriteHeader(204)
 			return

@@ -17,6 +17,7 @@ import (
 	"github.com/example/safefilehub/internal/db"
 	"github.com/example/safefilehub/internal/httpapi"
 	"github.com/example/safefilehub/internal/limits"
+	"github.com/example/safefilehub/internal/metrics"
 	"github.com/example/safefilehub/internal/permission"
 	"github.com/example/safefilehub/internal/storage"
 	"github.com/example/safefilehub/internal/upload"
@@ -101,6 +102,7 @@ func runWithLifecycle(lifecycle context.Context, args []string, cfg config.Confi
 	}
 	defer func() { _ = store.Close() }()
 
+	observability := metrics.New()
 	if opts.recoverOnStart {
 		recovery := upload.New(repo, store, cfg.ChunkSize, cfg.UploadSessionTTL)
 		report, err := recovery.Recover(lifecycle, opts.limit, opts.dryRun)
@@ -114,6 +116,11 @@ func runWithLifecycle(lifecycle context.Context, args []string, cfg config.Confi
 			}
 			log.Printf("SafeFileHub upload recovery failed: %v", err)
 		} else {
+			if !opts.dryRun {
+				for range report.Cancelled + report.Orphans {
+					observability.IncCleanup()
+				}
+			}
 			log.Printf("SafeFileHub upload recovery: checked=%d kept=%d cleaned=%d orphans=%d dry_run=%t limit=%d", report.Checked, report.Kept, report.Cancelled, report.Orphans, opts.dryRun, opts.limit)
 		}
 	}
@@ -121,7 +128,7 @@ func runWithLifecycle(lifecycle context.Context, args []string, cfg config.Confi
 		return nil
 	}
 
-	h, err := httpapi.NewServerWithUploads(cfg, auth.NewService(repo), sessions, repo, permission.NewAuthorizer(repo, cfg.NamePolicy), store, limiter)
+	h, err := httpapi.NewServerWithUploadsAndObservability(cfg, auth.NewService(repo), sessions, repo, permission.NewAuthorizer(repo, cfg.NamePolicy), store, observability, limiter)
 	if err != nil {
 		return err
 	}
