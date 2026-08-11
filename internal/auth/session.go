@@ -24,6 +24,10 @@ type SessionStore interface {
 	Create(context.Context, Session) error
 	Lookup(context.Context, string) (Session, error)
 	Delete(context.Context, string) error
+	// DeleteExpired removes at most limit sessions expiring at or before now.
+	// It is intentionally bounded so login/request paths cannot be used to
+	// trigger unbounded maintenance work.
+	DeleteExpired(context.Context, time.Time, int) (int, error)
 }
 type SessionConfig struct {
 	CookieName string
@@ -32,6 +36,9 @@ type SessionConfig struct {
 	SameSite   http.SameSite
 	Now        func() time.Time
 }
+
+const sessionGCMaxDeletes = 64
+
 type SessionManager struct {
 	store  SessionStore
 	config SessionConfig
@@ -53,6 +60,7 @@ func NewSessionManager(store SessionStore, config SessionConfig) *SessionManager
 	return &SessionManager{store: store, config: config}
 }
 func (m *SessionManager) Create(ctx context.Context, userID int64) (string, error) {
+	m.gc(ctx)
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
@@ -74,6 +82,17 @@ func (m *SessionManager) UserID(ctx context.Context, id string) (int64, error) {
 	}
 	return s.UserID, nil
 }
+
+// GC performs one bounded maintenance pass. Callers that need to drain a
+// larger backlog can invoke it repeatedly from a maintenance loop.
+func (m *SessionManager) GC(ctx context.Context) (int, error) {
+	return m.store.DeleteExpired(ctx, m.config.Now().UTC(), sessionGCMaxDeletes)
+}
+
+func (m *SessionManager) gc(ctx context.Context) {
+	_, _ = m.GC(ctx)
+}
+
 func (m *SessionManager) SetCookie(w http.ResponseWriter, id string) {
 	now := m.config.Now().UTC()
 	http.SetCookie(w, &http.Cookie{Name: m.config.CookieName, Value: id, Path: "/", Expires: now.Add(m.config.TTL), MaxAge: int(m.config.TTL.Seconds()), Secure: m.config.Secure, HttpOnly: true, SameSite: m.config.SameSite})
@@ -108,6 +127,24 @@ func (s *memorySessionStore) Delete(_ context.Context, id string) error {
 	delete(s.sessions, id)
 	return nil
 }
+func (s *memorySessionStore) DeleteExpired(_ context.Context, now time.Time, limit int) (int, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	deleted := 0
+	for id, session := range s.sessions {
+		if !session.ExpiresAt.After(now) {
+			delete(s.sessions, id)
+			deleted++
+			if deleted == limit {
+				break
+			}
+		}
+	}
+	return deleted, nil
+}
 
 type Service struct {
 	users interface {
@@ -120,9 +157,20 @@ func NewService(users interface {
 }) *Service {
 	return &Service{users: users}
 }
+
+// dummyPasswordHash is generated with the fixed verifier parameters and is a
+// package constant, never data supplied by the user database.
+const dummyPasswordHash = "$argon2id$v=19$m=65536,t=3,p=1$HuMhhGn/0DHkTtaVeqF4Uw$e6aHIED4yL6VDXJ/G63RvTv+IhHE22Kz8RvrvDrkfJ8"
+
 func (s *Service) Authenticate(ctx context.Context, username, password string) (db.User, error) {
 	u, err := s.users.UserByUsername(ctx, username)
-	if err != nil || u.Disabled || !VerifyPassword(u.PasswordHash, password) {
+	if err != nil || u.Disabled {
+		// Always perform a bounded, database-independent verification to make
+		// absent and disabled accounts indistinguishable from bad credentials.
+		_ = VerifyPassword(dummyPasswordHash, password)
+		return db.User{}, ErrInvalidCredentials
+	}
+	if !VerifyPassword(u.PasswordHash, password) {
 		return db.User{}, ErrInvalidCredentials
 	}
 	return u, nil

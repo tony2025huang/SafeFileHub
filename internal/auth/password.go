@@ -22,6 +22,9 @@ type argon2Params struct {
 	keyLength   uint32
 }
 
+// These fixed parameters bound each login verification to 64 MiB and one
+// worker. Accepting attacker-controlled encoded parameters would otherwise
+// let a stored/corrupt hash exhaust the login concurrency memory budget.
 var defaultArgon2 = argon2Params{memory: 64 * 1024, iterations: 3, parallelism: 1, saltLength: 16, keyLength: 32}
 
 // HashPassword returns a self-describing Argon2id encoded hash. It never
@@ -53,15 +56,20 @@ func parseHash(encoded string) (argon2Params, []byte, []byte, bool) {
 		return argon2Params{}, nil, nil, false
 	}
 	var p argon2Params
-	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &p.memory, &p.iterations, &p.parallelism); err != nil || p.memory == 0 || p.iterations == 0 || p.parallelism == 0 || p.memory > 256*1024 || p.iterations > 10 || p.parallelism > 16 {
+	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &p.memory, &p.iterations, &p.parallelism); err != nil || parts[3] != fmt.Sprintf("m=%d,t=%d,p=%d", defaultArgon2.memory, defaultArgon2.iterations, defaultArgon2.parallelism) {
+		return argon2Params{}, nil, nil, false
+	}
+	// Bound input before decoding and require the generated fixed-size values.
+	// This avoids allocating for arbitrarily long attacker/database input.
+	if len(parts[4]) > base64.RawStdEncoding.EncodedLen(int(defaultArgon2.saltLength)) || len(parts[5]) > base64.RawStdEncoding.EncodedLen(int(defaultArgon2.keyLength)) {
 		return argon2Params{}, nil, nil, false
 	}
 	salt, err := base64.RawStdEncoding.DecodeString(parts[4])
-	if err != nil || len(salt) < 16 {
+	if err != nil || len(salt) != int(defaultArgon2.saltLength) {
 		return argon2Params{}, nil, nil, false
 	}
 	hash, err := base64.RawStdEncoding.DecodeString(parts[5])
-	if err != nil || len(hash) < 16 {
+	if err != nil || len(hash) != int(defaultArgon2.keyLength) {
 		return argon2Params{}, nil, nil, false
 	}
 	return p, salt, hash, true

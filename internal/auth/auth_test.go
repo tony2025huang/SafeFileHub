@@ -41,6 +41,24 @@ func TestPasswordHashAndAuthenticate(t *testing.T) {
 	}
 }
 
+func TestVerifyPasswordRejectsUntrustedOrOversizedArgon2idParameters(t *testing.T) {
+	hash, err := auth.HashPassword("password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, malicious := range []string{
+		strings.Replace(hash, "m=65536", "m=262144", 1),
+		strings.Replace(hash, "t=3", "t=4", 1),
+		strings.Replace(hash, "p=1", "p=2", 1),
+		strings.Replace(hash, "$argon2id$", "$argon2i$", 1),
+		"$argon2id$v=19$m=65536,t=3,p=1$" + strings.Repeat("A", 4096) + "$" + strings.Repeat("A", 4096),
+	} {
+		if auth.VerifyPassword(malicious, "password") {
+			t.Fatalf("VerifyPassword accepted untrusted hash %q", malicious)
+		}
+	}
+}
+
 func TestAuthenticateRejectsDisabledUser(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -88,6 +106,25 @@ func TestSessionCookieIsSecureAsConfiguredAndExpires(t *testing.T) {
 	now = now.Add(time.Hour)
 	if _, err := manager.UserID(context.Background(), id); !errors.Is(err, auth.ErrSessionExpired) {
 		t.Fatalf("expired session error = %v, want ErrSessionExpired", err)
+	}
+}
+
+func TestSessionManagerGarbageCollectsUnaccessedExpiredSessions(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
+	store := auth.NewMemorySessionStore()
+	manager := auth.NewSessionManager(store, auth.SessionConfig{
+		TTL: time.Hour,
+		Now: func() time.Time { return now },
+	})
+	if err := store.Create(context.Background(), auth.Session{ID: "expired", UserID: 1, ExpiresAt: now.Add(-time.Second)}); err != nil {
+		t.Fatalf("seed expired session: %v", err)
+	}
+	if _, err := manager.Create(context.Background(), 2); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := store.Lookup(context.Background(), "expired"); !errors.Is(err, auth.ErrSessionNotFound) {
+		t.Fatalf("expired session after GC = %v, want ErrSessionNotFound", err)
 	}
 }
 

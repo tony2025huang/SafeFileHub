@@ -101,6 +101,62 @@ func TestMigrateRecordsVersionsAndDoesNotReplayAppliedMigrations(t *testing.T) {
 	}
 }
 
+func TestPermissionMigrationUpgradesExisting001Data(t *testing.T) {
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "legacy.sqlite")
+	database, err := sql.Open("sqlite", sqliteDSN(databasePath))
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	if _, err := database.ExecContext(ctx, mustReadMigration(t, "001_initial.sql")); err != nil {
+		_ = database.Close()
+		t.Fatalf("apply 001: %v", err)
+	}
+	if _, err := database.ExecContext(ctx, `CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, applied_at INTEGER NOT NULL); INSERT INTO schema_migrations VALUES ('001_initial', 0); INSERT INTO users (id, username, password_hash, disabled, created_at, updated_at) VALUES (7, 'user', 'hash', 0, 0, 0); INSERT INTO storage_roots (id, name, path, created_at, updated_at) VALUES (9, 'root', '/root', 0, 0); INSERT INTO permissions (id, user_id, root_id, path_prefix, action, allow, created_at, updated_at) VALUES (11, 7, 9, '/docs', 'read', 1, 0, 0);`); err != nil {
+		_ = database.Close()
+		t.Fatalf("seed 001 database: %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("close legacy database: %v", err)
+	}
+
+	repo, err := Open(ctx, databasePath)
+	if err != nil {
+		t.Fatalf("upgrade legacy database: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	var id, userID, rootID int64
+	if err := repo.db.QueryRowContext(ctx, "SELECT id, user_id, root_id FROM permissions").Scan(&id, &userID, &rootID); err != nil || id != 11 || userID != 7 || rootID != 9 {
+		t.Fatalf("upgraded permission identity = (%d, %d, %d), %v", id, userID, rootID, err)
+	}
+	if _, err := repo.db.ExecContext(ctx, "INSERT INTO permissions (user_id, root_id, path_prefix, action, allow, created_at, updated_at) VALUES (7, 9, '/docs', 'read', 0, 0, 0)"); err != nil {
+		t.Fatalf("insert equal-prefix deny: %v", err)
+	}
+	if _, err := repo.db.ExecContext(ctx, "INSERT INTO permissions (user_id, root_id, path_prefix, action, allow, created_at, updated_at) VALUES (7, 9, '/docs', 'read', 1, 0, 0)"); err == nil {
+		t.Fatal("duplicate permission with same allow value succeeded")
+	}
+	var indexCount int
+	if err := repo.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_index_list('permissions') WHERE name = 'permissions_user_root_idx'").Scan(&indexCount); err != nil || indexCount != 1 {
+		t.Fatalf("permissions_user_root_idx = %d, %v", indexCount, err)
+	}
+	if _, err := repo.db.ExecContext(ctx, "DELETE FROM users WHERE id = 7"); err != nil {
+		t.Fatalf("delete parent user: %v", err)
+	}
+	var count int
+	if err := repo.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM permissions").Scan(&count); err != nil || count != 0 {
+		t.Fatalf("cascaded permissions count = %d, %v", count, err)
+	}
+}
+
+func mustReadMigration(t *testing.T, name string) string {
+	t.Helper()
+	contents, err := migrationFiles.ReadFile("migrations/" + name)
+	if err != nil {
+		t.Fatalf("read migration %s: %v", name, err)
+	}
+	return string(contents)
+}
+
 func TestMigrationVersionsAreAppliedInOrder(t *testing.T) {
 	files, err := migrationFiles.ReadDir("migrations")
 	if err != nil {
