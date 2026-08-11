@@ -26,6 +26,8 @@ type SessionStore interface {
 	Create(context.Context, Session) error
 	Lookup(context.Context, string) (Session, error)
 	Delete(context.Context, string) error
+	// DeleteForUser invalidates every active session belonging to the user.
+	DeleteForUser(context.Context, int64) error
 	// DeleteExpired removes at most limit sessions expiring at or before now.
 	// It is intentionally bounded so login/request paths cannot be used to
 	// trigger unbounded maintenance work.
@@ -118,6 +120,13 @@ func (m *SessionManager) Revoke(ctx context.Context, id string) error {
 // Logout revokes the supplied server-side session.
 func (m *SessionManager) Logout(ctx context.Context, id string) error {
 	return m.Revoke(ctx, id)
+}
+
+// RevokeUser invalidates all server-side sessions for a user, including cookies
+// already issued before an administrator disabled the account.
+func (m *SessionManager) RevokeUser(ctx context.Context, userID int64) error {
+	if userID <= 0 { return nil }
+	return m.store.DeleteForUser(ctx, userID)
 }
 
 func (m *SessionManager) UserID(ctx context.Context, id string) (int64, error) {
@@ -241,6 +250,14 @@ func (s *memorySessionStore) Delete(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.sessions, id)
+	return nil
+}
+func (s *memorySessionStore) DeleteForUser(_ context.Context, userID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, session := range s.sessions {
+		if session.UserID == userID { delete(s.sessions, id) }
+	}
 	return nil
 }
 func (s *memorySessionStore) DeleteExpired(_ context.Context, now time.Time, limit int) (int, error) {

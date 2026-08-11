@@ -41,6 +41,9 @@ type Config struct {
 	// handler or socket timeout.
 	RequestIdleTimeout time.Duration
 	NamePolicy         NamePolicy
+	// AdminUsernames identifies the small bootstrap set permitted to manage
+	// users and scoped permissions. Authentication remains session-based.
+	AdminUsernames []string
 }
 
 func Default() Config {

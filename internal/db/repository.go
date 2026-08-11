@@ -102,6 +102,30 @@ func (r *Repository) UserByUsername(ctx context.Context, username string) (User,
 	return scanUser(row)
 }
 
+// UserByID returns one user for management authorization and mutation.
+func (r *Repository) UserByID(ctx context.Context, id int64) (User, error) {
+	row := r.db.QueryRowContext(ctx, `SELECT id, username, password_hash, disabled, created_at, updated_at FROM users WHERE id = ?`, id)
+	return scanUser(row)
+}
+
+// UpdateUserCredentials changes password material and/or disabled state without
+// exposing the resulting hash to callers. It is deliberately conditional so a
+// missing target cannot be mistaken for a successful management operation.
+func (r *Repository) UpdateUserCredentials(ctx context.Context, id int64, passwordHash string, disabled bool) error {
+	result, err := r.db.ExecContext(ctx, `UPDATE users SET password_hash = ?, disabled = ?, updated_at = ? WHERE id = ?`, passwordHash, boolInt(disabled), unixNano(time.Now().UTC()), id)
+	if err != nil {
+		return fmt.Errorf("update user credentials: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("confirm user credentials update: %w", err)
+	}
+	if n != 1 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (r *Repository) CreateStorageRoot(ctx context.Context, root StorageRoot) (StorageRoot, error) {
 	createdAt := utcOrNow(root.CreatedAt)
 	updatedAt := utcOrNow(root.UpdatedAt)
