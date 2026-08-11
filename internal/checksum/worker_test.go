@@ -23,6 +23,20 @@ type fakeTasks struct {
 	mu        sync.Mutex
 }
 
+type blockingClaimTasks struct {
+	fakeTasks
+	claimed chan struct{}
+}
+
+func (f *blockingClaimTasks) ClaimMD5Task(ctx context.Context) (db.MD5Task, error) {
+	select {
+	case f.claimed <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	return db.MD5Task{}, ctx.Err()
+}
+
 func (f *fakeTasks) RequeueComputingMD5Tasks(context.Context, int) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -109,6 +123,28 @@ func TestWorkerRunStopsOnCancellation(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("worker did not stop after cancellation")
+	}
+}
+
+func TestWorkerRunStopsWhileWaitingForClaim(t *testing.T) {
+	f := &blockingClaimTasks{fakeTasks: fakeTasks{files: map[int64]db.File{}, complete: map[int64]string{}, failed: map[int64]string{}}, claimed: make(chan struct{}, 1)}
+	w := NewWorker(f, localObjects{t.TempDir()}, Options{MaxTasksPerRun: 1})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- w.Run(ctx, time.Hour) }()
+	select {
+	case <-f.claimed:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not begin claiming a task")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker did not stop while claim was blocked")
 	}
 }
 
