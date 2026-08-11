@@ -185,3 +185,75 @@ func isLowerHex(value string) bool {
 	}
 	return true
 }
+
+// CreateStaging creates a private resumable-upload staging file below the
+// already-open store root. Its relative name is caller-generated and never
+// returned by HTTP handlers.
+func (s *ObjectStore) CreateStaging(name string) (*os.File, error) {
+	if !validStagingName(name) {
+		return nil, fmt.Errorf("invalid staging name")
+	}
+	rootFD, err := s.rootFD()
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(rootFD)
+	d, err := openDirectoryAt(rootFD, "staging", true)
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(d)
+	fd, err := unix.Openat(d, strings.TrimPrefix(name, "staging/"), unix.O_RDWR|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("create staging: %w", err)
+	}
+	return os.NewFile(uintptr(fd), name), nil
+}
+func (s *ObjectStore) OpenStaging(name string) (*os.File, error) {
+	return s.openStaging(name, unix.O_RDONLY)
+}
+func (s *ObjectStore) OpenStagingWrite(name string) (*os.File, error) {
+	return s.openStaging(name, unix.O_WRONLY)
+}
+func (s *ObjectStore) openStaging(name string, flags int) (*os.File, error) {
+	if !validStagingName(name) {
+		return nil, fmt.Errorf("invalid staging name")
+	}
+	rootFD, err := s.rootFD()
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(rootFD)
+	d, err := openDirectoryAt(rootFD, "staging", false)
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(d)
+	fd, err := unix.Openat(d, strings.TrimPrefix(name, "staging/"), flags|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open staging: %w", err)
+	}
+	return os.NewFile(uintptr(fd), name), nil
+}
+func (s *ObjectStore) RemoveStaging(name string) error {
+	if !validStagingName(name) {
+		return fmt.Errorf("invalid staging name")
+	}
+	rootFD, err := s.rootFD()
+	if err != nil {
+		return err
+	}
+	defer unix.Close(rootFD)
+	d, err := openDirectoryAt(rootFD, "staging", false)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(d)
+	if err := unix.Unlinkat(d, strings.TrimPrefix(name, "staging/"), 0); err != nil && err != unix.ENOENT {
+		return fmt.Errorf("remove staging: %w", err)
+	}
+	return nil
+}
+func validStagingName(name string) bool {
+	return strings.HasPrefix(name, "staging/") && len(strings.TrimPrefix(name, "staging/")) == 37 && strings.HasSuffix(name, ".part") && !strings.Contains(strings.TrimPrefix(name, "staging/"), "/")
+}

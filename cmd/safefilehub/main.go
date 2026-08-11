@@ -14,6 +14,8 @@ import (
 	"github.com/example/safefilehub/internal/db"
 	"github.com/example/safefilehub/internal/httpapi"
 	"github.com/example/safefilehub/internal/limits"
+	"github.com/example/safefilehub/internal/permission"
+	"github.com/example/safefilehub/internal/storage"
 )
 
 func main() {
@@ -33,7 +35,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	h, err := httpapi.NewServerWithAuth(cfg, auth.NewService(repo), sessions, limiter)
+	store, err := storage.NewObjectStore(cfg.StorageRoot)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	h, err := httpapi.NewServerWithUploads(cfg, auth.NewService(repo), sessions, repo, permission.NewAuthorizer(repo, cfg.NamePolicy), store, limiter)
 	if err != nil {
 		log.Fatal(err)
 	}

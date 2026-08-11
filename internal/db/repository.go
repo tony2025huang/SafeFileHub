@@ -62,6 +62,7 @@ type UploadSession struct {
 	LogicalPath string
 	StagingPath string
 	Offset      int64
+	Length      int64
 	ExpiresAt   time.Time
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
@@ -234,7 +235,7 @@ func (r *Repository) CreateUploadSession(ctx context.Context, session UploadSess
 		updatedAt = createdAt
 	}
 	expiresAt := utcOrNow(session.ExpiresAt)
-	result, err := r.db.ExecContext(ctx, `INSERT INTO upload_sessions (id, user_id, root_id, logical_path, staging_path, offset, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, session.ID, session.UserID, session.RootID, session.LogicalPath, session.StagingPath, session.Offset, unixNano(expiresAt), unixNano(createdAt), unixNano(updatedAt))
+	result, err := r.db.ExecContext(ctx, `INSERT INTO upload_sessions (id, user_id, root_id, logical_path, staging_path, offset, length, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, session.ID, session.UserID, session.RootID, session.LogicalPath, session.StagingPath, session.Offset, session.Length, unixNano(expiresAt), unixNano(createdAt), unixNano(updatedAt))
 	if err != nil {
 		return UploadSession{}, classifyError(err)
 	}
@@ -248,12 +249,42 @@ func (r *Repository) CreateUploadSession(ctx context.Context, session UploadSess
 func (r *Repository) UploadSessionByID(ctx context.Context, id string) (UploadSession, error) {
 	var session UploadSession
 	var expiresAt, createdAt, updatedAt int64
-	err := r.db.QueryRowContext(ctx, `SELECT id, user_id, root_id, logical_path, staging_path, offset, expires_at, created_at, updated_at FROM upload_sessions WHERE id = ?`, id).Scan(&session.ID, &session.UserID, &session.RootID, &session.LogicalPath, &session.StagingPath, &session.Offset, &expiresAt, &createdAt, &updatedAt)
+	err := r.db.QueryRowContext(ctx, `SELECT id, user_id, root_id, logical_path, staging_path, offset, length, expires_at, created_at, updated_at FROM upload_sessions WHERE id = ?`, id).Scan(&session.ID, &session.UserID, &session.RootID, &session.LogicalPath, &session.StagingPath, &session.Offset, &session.Length, &expiresAt, &createdAt, &updatedAt)
 	if err != nil {
 		return UploadSession{}, classifyError(err)
 	}
 	session.ExpiresAt, session.CreatedAt, session.UpdatedAt = fromUnixNano(expiresAt), fromUnixNano(createdAt), fromUnixNano(updatedAt)
 	return session, nil
+}
+
+func (r *Repository) UpdateUploadOffset(ctx context.Context, id string, expected, offset int64) error {
+	result, err := r.db.ExecContext(ctx, `UPDATE upload_sessions SET offset = ?, updated_at = ? WHERE id = ? AND offset = ?`, offset, unixNano(time.Now().UTC()), id, expected)
+	if err != nil {
+		return fmt.Errorf("update upload offset: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("confirm upload offset: %w", err)
+	}
+	if n != 1 {
+		return ErrConflict
+	}
+	return nil
+}
+
+func (r *Repository) DeleteUploadSession(ctx context.Context, id string) error {
+	result, err := r.db.ExecContext(ctx, `DELETE FROM upload_sessions WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete upload session: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("confirm upload session delete: %w", err)
+	}
+	if n != 1 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (r *Repository) CreateAuditEvent(ctx context.Context, event AuditEvent) (AuditEvent, error) {
