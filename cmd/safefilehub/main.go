@@ -53,17 +53,39 @@ func parseMaintenanceOptions(args []string, cfg config.Config) (maintenanceOptio
 }
 
 func main() {
-	cfg := config.Default()
-	opts, err := parseMaintenanceOptions(os.Args[1:], cfg)
+	err := run(os.Args[1:])
 	if err != nil {
-		log.Fatal(err)
+		log.Print(err)
 	}
+	os.Exit(exitCode(err))
+}
+
+func exitCode(err error) int {
+	if err != nil {
+		return 1
+	}
+	return 0
+}
+
+func run(args []string) error {
 	lifecycle, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	return runWithLifecycle(lifecycle, args, config.Default())
+}
+
+func runWithLifecycle(lifecycle context.Context, args []string, cfg config.Config) error {
+	opts, err := parseMaintenanceOptions(args, cfg)
+	if err != nil {
+		return err
+	}
+	if errors.Is(lifecycle.Err(), context.Canceled) {
+		log.Printf("SafeFileHub upload recovery cancelled: %v", lifecycle.Err())
+		return nil
+	}
 
 	repo, err := db.Open(lifecycle, cfg.SQLitePath)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer func() { _ = repo.Close() }()
 
@@ -71,11 +93,11 @@ func main() {
 	defer sessions.Close()
 	limiter, err := limits.NewUploadLimiter(cfg.UploadConcurrency, cfg.PerUserUploadConcurrency, cfg.PerIPUploadConcurrency)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	store, err := storage.NewObjectStore(cfg.StorageRoot)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer func() { _ = store.Close() }()
 
@@ -85,23 +107,23 @@ func main() {
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				log.Printf("SafeFileHub upload recovery cancelled: %v", err)
-				return
+				return nil
+			}
+			if opts.recoverOnly {
+				return fmt.Errorf("SafeFileHub upload recovery: %w", err)
 			}
 			log.Printf("SafeFileHub upload recovery failed: %v", err)
-			if opts.recoverOnly {
-				return
-			}
 		} else {
 			log.Printf("SafeFileHub upload recovery: checked=%d kept=%d cleaned=%d orphans=%d dry_run=%t limit=%d", report.Checked, report.Kept, report.Cancelled, report.Orphans, opts.dryRun, opts.limit)
 		}
 	}
 	if opts.recoverOnly {
-		return
+		return nil
 	}
 
 	h, err := httpapi.NewServerWithUploads(cfg, auth.NewService(repo), sessions, repo, permission.NewAuthorizer(repo, cfg.NamePolicy), store, limiter)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	server := httpapi.ServerTimeouts(cfg, h)
@@ -115,6 +137,7 @@ func main() {
 	}()
 	log.Printf("SafeFileHub listening on %s", cfg.ListenAddr)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Printf("SafeFileHub server: %v", err)
+		return fmt.Errorf("SafeFileHub server: %w", err)
 	}
+	return nil
 }
