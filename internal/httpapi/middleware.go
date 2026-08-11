@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -10,12 +11,8 @@ import (
 	"github.com/example/safefilehub/internal/limits"
 )
 
-// UploadIdentity obtains the authenticated user and canonical client IP for an
-// upload request. Upload endpoints can supply their own auth-aware extractor.
 type UploadIdentity func(*http.Request) (user, ip string)
 
-// LimitUpload rejects work when any upload capacity limit is reached. It does
-// not wait or create goroutines, so saturation cannot create an internal queue.
 func LimitUpload(limiter *limits.UploadLimiter, retryAfter time.Duration, identity UploadIdentity, next http.Handler) http.Handler {
 	if retryAfter < time.Second {
 		retryAfter = time.Second
@@ -33,27 +30,22 @@ func LimitUpload(limiter *limits.UploadLimiter, retryAfter time.Duration, identi
 	})
 }
 
-// RequestLimits bounds body size and handler lifetime. Server read/write and
-// idle socket timeouts must additionally be set via ServerTimeouts.
+// RequestLimits applies body limits and only an explicitly configured total
+// handler deadline. Socket timeouts are independently configured below.
 func RequestLimits(cfg config.Config, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), cfg.RequestIdleTimeout)
-		defer cancel()
-		r = r.WithContext(ctx)
+		if cfg.RequestTimeout > 0 {
+			ctx, cancel := context.WithTimeout(r.Context(), cfg.RequestTimeout)
+			defer cancel()
+			r = r.WithContext(ctx)
+		}
 		r.Body = http.MaxBytesReader(w, r.Body, cfg.MaxRequestBodyBytes)
 		next.ServeHTTP(w, r)
 	})
 }
 
-// ServerTimeouts applies the configured request timeout to socket reads and
-// writes for the standard net/http server.
+func requestTooLarge(err error) bool { var maxErr *http.MaxBytesError; return errors.As(err, &maxErr) }
+
 func ServerTimeouts(cfg config.Config, handler http.Handler) *http.Server {
-	return &http.Server{
-		Addr:              cfg.ListenAddr,
-		Handler:           RequestLimits(cfg, handler),
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       cfg.RequestIdleTimeout,
-		WriteTimeout:      cfg.RequestIdleTimeout,
-		IdleTimeout:       cfg.RequestIdleTimeout,
-	}
+	return &http.Server{Addr: cfg.ListenAddr, Handler: RequestLimits(cfg, handler), ReadHeaderTimeout: cfg.ReadHeaderTimeout, ReadTimeout: cfg.ReadTimeout, WriteTimeout: cfg.WriteTimeout, IdleTimeout: cfg.IdleTimeout}
 }

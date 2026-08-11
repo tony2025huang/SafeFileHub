@@ -6,10 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/example/safefilehub/internal/config"
 	"github.com/example/safefilehub/internal/db"
+	"github.com/example/safefilehub/internal/limits"
 )
 
 // NewServer returns an in-memory HTTP handler configured for SafeFileHub.
@@ -20,7 +25,7 @@ func NewServer(cfg config.Config) (http.Handler, error) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthz)
-	return mux, nil
+	return RequestLimits(cfg, mux), nil
 }
 
 type authenticator interface {
@@ -38,19 +43,39 @@ type sessionManager interface {
 
 // NewServerWithAuth adds the minimal Task 4 authentication surface. File
 // storage endpoints deliberately remain out of scope until Task 5.
-func NewServerWithAuth(cfg config.Config, users authenticator, sessions sessionManager) (http.Handler, error) {
+func NewServerWithAuth(cfg config.Config, users authenticator, sessions sessionManager, suppliedLimiter ...*limits.UploadLimiter) (http.Handler, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("validate server configuration: %w", err)
 	}
 	if users == nil || sessions == nil {
 		return nil, errors.New("authentication dependencies are required")
 	}
+	limiter, err := newUploadLimiter(cfg, suppliedLimiter)
+	if err != nil {
+		return nil, err
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthz)
 	mux.HandleFunc("POST /login", login(users, sessions))
 	mux.HandleFunc("POST /logout", logout(sessions))
 	mux.Handle("GET /session", requireSession(sessions, http.HandlerFunc(sessionStatus)))
-	return mux, nil
+	upload := requireSession(sessions, LimitUpload(limiter, time.Second, sessionUploadIdentity, http.HandlerFunc(uploadPlaceholder)))
+	mux.Handle("POST /api/uploads", upload)
+	return RequestLimits(cfg, mux), nil
+}
+
+func newUploadLimiter(cfg config.Config, supplied []*limits.UploadLimiter) (*limits.UploadLimiter, error) {
+	if len(supplied) > 1 {
+		return nil, errors.New("only one upload limiter may be supplied")
+	}
+	if len(supplied) == 1 && supplied[0] != nil {
+		return supplied[0], nil
+	}
+	limiter, err := limits.NewUploadLimiter(cfg.UploadConcurrency, cfg.PerUserUploadConcurrency, cfg.PerIPUploadConcurrency)
+	if err != nil {
+		return nil, fmt.Errorf("create upload limiter: %w", err)
+	}
+	return limiter, nil
 }
 
 type loginRequest struct {
@@ -125,4 +150,39 @@ func sessionStatus(w http.ResponseWriter, _ *http.Request) {
 func healthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = w.Write([]byte("ok\n"))
+}
+
+func sessionUploadIdentity(r *http.Request) (string, string) {
+	userID, _ := r.Context().Value(sessionUserIDKey{}).(int64)
+	ip, _ := clientIP(r)
+	return strconv.FormatInt(userID, 10), ip
+}
+
+// clientIP trusts only the socket peer address. Forwarded headers remain
+// untrusted until an explicit trusted-proxy configuration exists.
+func clientIP(r *http.Request) (string, bool) {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return "", false
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return "", false
+	}
+	return ip.String(), true
+}
+
+// uploadPlaceholder intentionally implements no upload protocol; it exercises
+// admission, session and body-size protections for future upload endpoints.
+func uploadPlaceholder(w http.ResponseWriter, r *http.Request) {
+	_, err := io.Copy(io.Discard, r.Body)
+	if requestTooLarge(err) {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	if err != nil {
+		http.Error(w, "read upload request", http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

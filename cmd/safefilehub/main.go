@@ -13,6 +13,7 @@ import (
 	"github.com/example/safefilehub/internal/config"
 	"github.com/example/safefilehub/internal/db"
 	"github.com/example/safefilehub/internal/httpapi"
+	"github.com/example/safefilehub/internal/limits"
 )
 
 func main() {
@@ -28,7 +29,11 @@ func main() {
 
 	sessions := auth.NewSessionManager(auth.NewMemorySessionStore(), auth.SessionConfig{LifecycleContext: lifecycle})
 	defer sessions.Close()
-	h, err := httpapi.NewServerWithAuth(cfg, auth.NewService(repo), sessions)
+	limiter, err := limits.NewUploadLimiter(cfg.UploadConcurrency, cfg.PerUserUploadConcurrency, cfg.PerIPUploadConcurrency)
+	if err != nil {
+		log.Fatal(err)
+	}
+	h, err := httpapi.NewServerWithAuth(cfg, auth.NewService(repo), sessions, limiter)
 	if err != nil {
 		log.Fatal(err)
 	}

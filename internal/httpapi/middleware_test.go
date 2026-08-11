@@ -73,7 +73,7 @@ func TestLimitUploadReleasesLeaseAfterSuccessErrorAndCancellation(t *testing.T) 
 func TestRequestLimitsBodyAndIdleTimeout(t *testing.T) {
 	cfg := config.Default()
 	cfg.MaxRequestBodyBytes = 3
-	cfg.RequestIdleTimeout = 10 * time.Millisecond
+	cfg.RequestTimeout = 10 * time.Millisecond
 	h := RequestLimits(cfg, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, err := r.Body.Read(make([]byte, 8))
 		if err != nil {

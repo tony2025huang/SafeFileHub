@@ -6,7 +6,6 @@ import (
 	"time"
 )
 
-// NamePolicy controls which special leading characters are disallowed in names.
 type NamePolicy struct {
 	RejectLeadingDot    bool
 	RejectLeadingTilde  bool
@@ -14,53 +13,35 @@ type NamePolicy struct {
 	RejectLeadingHash   bool
 }
 
-// Config contains the runtime settings needed by the service.
 type Config struct {
-	StorageRoot string
-	SQLitePath  string
-	ListenAddr  string
-
+	StorageRoot              string
+	SQLitePath               string
+	ListenAddr               string
 	UploadConcurrency        int
 	DownloadConcurrency      int
 	PerUserUploadConcurrency int
 	PerIPUploadConcurrency   int
 	ChunkSize                int64
-
-	UploadIdleTimeout time.Duration
-	UploadSessionTTL  time.Duration
-	// MaxRequestBodyBytes bounds HTTP request bodies before handlers read them.
-	MaxRequestBodyBytes int64
-	// RequestIdleTimeout bounds the lifetime of an individual request handler.
+	UploadIdleTimeout        time.Duration
+	UploadSessionTTL         time.Duration
+	MaxRequestBodyBytes      int64
+	// RequestTimeout is an optional total handler deadline. Zero permits
+	// streaming requests to continue without a wall-clock handler deadline.
+	RequestTimeout    time.Duration
+	ReadHeaderTimeout time.Duration
+	ReadTimeout       time.Duration
+	WriteTimeout      time.Duration
+	IdleTimeout       time.Duration
+	// Retained for backwards configuration compatibility; no longer used as a
+	// handler or socket timeout.
 	RequestIdleTimeout time.Duration
-
-	NamePolicy NamePolicy
+	NamePolicy         NamePolicy
 }
 
-// Default returns SafeFileHub's deterministic baseline configuration.
 func Default() Config {
-	return Config{
-		StorageRoot:              "data",
-		SQLitePath:               "data/safefilehub.db",
-		ListenAddr:               ":8080",
-		UploadConcurrency:        16,
-		DownloadConcurrency:      16,
-		PerUserUploadConcurrency: 4,
-		PerIPUploadConcurrency:   8,
-		ChunkSize:                8 << 20,
-		UploadIdleTimeout:        30 * time.Minute,
-		UploadSessionTTL:         24 * time.Hour,
-		MaxRequestBodyBytes:      64 << 20,
-		RequestIdleTimeout:       30 * time.Minute,
-		NamePolicy: NamePolicy{
-			RejectLeadingDot:    true,
-			RejectLeadingTilde:  true,
-			RejectLeadingDollar: true,
-			RejectLeadingHash:   true,
-		},
-	}
+	return Config{StorageRoot: "data", SQLitePath: "data/safefilehub.db", ListenAddr: ":8080", UploadConcurrency: 16, DownloadConcurrency: 16, PerUserUploadConcurrency: 4, PerIPUploadConcurrency: 8, ChunkSize: 8 << 20, UploadIdleTimeout: 30 * time.Minute, UploadSessionTTL: 24 * time.Hour, MaxRequestBodyBytes: 64 << 20, RequestTimeout: 0, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 0, WriteTimeout: 0, IdleTimeout: 30 * time.Minute, RequestIdleTimeout: 30 * time.Minute, NamePolicy: NamePolicy{RejectLeadingDot: true, RejectLeadingTilde: true, RejectLeadingDollar: true, RejectLeadingHash: true}}
 }
 
-// Validate rejects invalid configuration before the service starts.
 func (c Config) Validate() error {
 	if c.StorageRoot == "" {
 		return fmt.Errorf("storage root must not be empty")
@@ -94,6 +75,18 @@ func (c Config) Validate() error {
 	}
 	if c.MaxRequestBodyBytes <= 0 {
 		return fmt.Errorf("max request body bytes must be positive")
+	}
+	if c.RequestTimeout < 0 {
+		return fmt.Errorf("request timeout must not be negative")
+	}
+	if c.ReadHeaderTimeout <= 0 {
+		return fmt.Errorf("read header timeout must be positive")
+	}
+	if c.ReadTimeout < 0 || c.WriteTimeout < 0 {
+		return fmt.Errorf("read and write timeouts must not be negative")
+	}
+	if c.IdleTimeout <= 0 {
+		return fmt.Errorf("idle timeout must be positive")
 	}
 	if c.RequestIdleTimeout <= 0 {
 		return fmt.Errorf("request idle timeout must be positive")
