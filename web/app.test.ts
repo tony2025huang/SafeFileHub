@@ -3,12 +3,23 @@
 // built-in runner is the smallest currently available test harness.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 
 import {
   DEFAULT_PER_FILE_CONCURRENCY,
   createUploadBatch,
   encodeLogicalPath,
 } from './app.ts';
+
+test('deployment HTML loads the browser-ready JavaScript entrypoint', async () => {
+  const [html, browserEntry, source] = await Promise.all([
+    readFile(new URL('./index.html', import.meta.url), 'utf8'),
+    readFile(new URL('./app.js', import.meta.url), 'utf8'),
+    readFile(new URL('./app.ts', import.meta.url), 'utf8'),
+  ]);
+  assert.match(html, /<script type="module" src="\.\/app\.js"><\/script>/);
+  assert.equal(browserEntry, source);
+});
 
 function file(name, body, relative = '') {
   return {
