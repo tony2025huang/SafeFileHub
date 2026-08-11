@@ -104,7 +104,7 @@ func TestAdminUserAndPermissionManagement(t *testing.T) {
 	}
 }
 
-func TestInitialAdminIDAuthorizesWithoutConfiguredUsername(t *testing.T) {
+func TestBootstrapAdminAuthorizesWithEmptyConfiguredUsernames(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	repo, err := db.Open(ctx, filepath.Join(t.TempDir(), "admin.db"))
@@ -119,6 +119,10 @@ func TestInitialAdminIDAuthorizesWithoutConfiguredUsername(t *testing.T) {
 	if initial.ID != 1 {
 		t.Fatalf("initial user ID = %d, want 1", initial.ID)
 	}
+	member, err := repo.CreateUser(ctx, db.User{Username: "member", PasswordHash: "hash"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfg := config.Default() // Production defaults deliberately do not need a plaintext username.
 	sessions := auth.NewSessionManager(auth.NewMemorySessionStore(), auth.SessionConfig{InsecureCookie: true})
 	defer sessions.Close()
@@ -126,11 +130,36 @@ func TestInitialAdminIDAuthorizesWithoutConfiguredUsername(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	server := httptest.NewServer(h)
+	defer server.Close()
 
-	r := adminJSON(t, h, adminSession(t, sessions, initial.ID), http.MethodPost, "/api/admin/users", `{"username":"member","password":"password"}`)
-	if r.Code != http.StatusCreated {
-		t.Fatalf("initial admin with default config = %d: %s", r.Code, r.Body.String())
+	created := adminHTTPJSON(t, server, adminSession(t, sessions, initial.ID), `{"username":"managed","password":"password"}`)
+	if created.StatusCode != http.StatusCreated {
+		created.Body.Close()
+		t.Fatalf("bootstrap admin with empty configured usernames = %d, want 201", created.StatusCode)
 	}
+	created.Body.Close()
+
+	forbidden := adminHTTPJSON(t, server, adminSession(t, sessions, member.ID), `{"username":"not-allowed","password":"password"}`)
+	defer forbidden.Body.Close()
+	if forbidden.StatusCode != http.StatusForbidden {
+		t.Fatalf("non-bootstrap user with empty configured usernames = %d, want 403", forbidden.StatusCode)
+	}
+}
+
+func adminHTTPJSON(t *testing.T, server *httptest.Server, cookie *http.Cookie, body string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/api/admin/users", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(cookie)
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
 }
 
 func TestAdminEndpointsRejectNonAdmins(t *testing.T) {
