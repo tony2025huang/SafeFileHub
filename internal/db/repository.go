@@ -383,7 +383,11 @@ func (r *Repository) DeleteUploadSession(ctx context.Context, id string) error {
 
 func (r *Repository) CreateAuditEvent(ctx context.Context, event AuditEvent) (AuditEvent, error) {
 	createdAt := utcOrNow(event.CreatedAt)
-	result, err := r.db.ExecContext(ctx, `INSERT INTO audit_events (user_id, root_id, action, logical_path, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)`, event.UserID, event.RootID, event.Action, event.LogicalPath, event.Detail, unixNano(createdAt))
+	var rootID any = event.RootID
+	if event.RootID == 0 {
+		rootID = nil
+	}
+	result, err := r.db.ExecContext(ctx, `INSERT INTO audit_events (user_id, root_id, action, logical_path, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)`, event.UserID, rootID, event.Action, event.LogicalPath, event.Detail, unixNano(createdAt))
 	if err != nil {
 		return AuditEvent{}, classifyError(err)
 	}
@@ -404,10 +408,12 @@ func (r *Repository) AuditEventsForUser(ctx context.Context, userID int64) ([]Au
 	var events []AuditEvent
 	for rows.Next() {
 		var event AuditEvent
+		var rootID sql.NullInt64
 		var createdAt int64
-		if err := rows.Scan(&event.ID, &event.UserID, &event.RootID, &event.Action, &event.LogicalPath, &event.Detail, &createdAt); err != nil {
+		if err := rows.Scan(&event.ID, &event.UserID, &rootID, &event.Action, &event.LogicalPath, &event.Detail, &createdAt); err != nil {
 			return nil, fmt.Errorf("scan audit event: %w", err)
 		}
+		event.RootID = rootID.Int64
 		event.CreatedAt = fromUnixNano(createdAt)
 		events = append(events, event)
 	}

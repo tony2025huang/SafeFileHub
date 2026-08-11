@@ -104,6 +104,18 @@ func TestRepositoryCRUDAndMigrationIdempotence(t *testing.T) {
 	if err != nil || len(events) != 1 || events[0].ID != event.ID || events[0].CreatedAt.Location() != time.UTC {
 		t.Fatalf("read audit events = %#v, %v", events, err)
 	}
+
+	globalEvent, err := repo.CreateAuditEvent(ctx, db.AuditEvent{UserID: user.ID, Action: "user.create", LogicalPath: "/api/admin/users", Detail: "target_user_id=2"})
+	if err != nil {
+		t.Fatalf("create global audit event: %v", err)
+	}
+	events, err = repo.AuditEventsForUser(ctx, user.ID)
+	if err != nil || len(events) != 2 || events[1].ID != globalEvent.ID || events[1].RootID != 0 {
+		t.Fatalf("read global audit event = %#v, %v", events, err)
+	}
+	if events[0].RootID != root.ID {
+		t.Fatalf("root-scoped audit event root ID = %d, want %d", events[0].RootID, root.ID)
+	}
 }
 
 func assertWAL(t *testing.T, databasePath string) {
