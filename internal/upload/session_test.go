@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -596,4 +597,143 @@ func waitForFile(t *testing.T, name string, timeout time.Duration) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", name)
+}
+
+func TestRecoverBoundedDryRunAndReconcilesLifecycle(t *testing.T) {
+	root := t.TempDir()
+	store, err := storage.NewObjectStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	repo, err := db.Open(context.Background(), root+"/meta.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	u, _ := repo.CreateUser(context.Background(), db.User{Username: "recover", PasswordHash: "x"})
+	r, _ := repo.CreateStorageRoot(context.Background(), db.StorageRoot{Name: "recover", Path: root})
+	m := New(repo, store, 1, time.Hour)
+	active, err := m.Create(context.Background(), u.ID, r.ID, "/active", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Write(context.Background(), active.ID, 0, bytes.NewBufferString("abc")); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		id, status string
+		expires    time.Time
+	}{
+		{"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "active", time.Now().Add(-time.Second)},
+		{"cccccccccccccccccccccccccccccccc", "cancelled", time.Now().Add(time.Hour)},
+	} {
+		name := "staging/" + tc.id + ".part"
+		f, err := store.CreateStaging(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Write([]byte("x")); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := repo.CreateUploadSession(context.Background(), db.UploadSession{ID: tc.id, UserID: u.ID, RootID: r.ID, LogicalPath: "/" + tc.id, StagingPath: name, Offset: 1, Length: 1, Status: tc.status, ExpiresAt: tc.expires}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	orphan, err := store.CreateStaging("staging/oooooooooooooooooooooooooooooooo.part")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := orphan.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dry, err := m.Recover(context.Background(), 64, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dry.Kept != 1 || dry.Cancelled != 2 || dry.Orphans != 1 {
+		t.Fatalf("dry report = %#v", dry)
+	}
+	for _, id := range []string{active.ID, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "cccccccccccccccccccccccccccccccc"} {
+		if _, err := repo.UploadSessionByID(context.Background(), id); err != nil {
+			t.Fatalf("dry run changed %s: %v", id, err)
+		}
+	}
+	if f, err := store.OpenStaging("staging/oooooooooooooooooooooooooooooooo.part"); err != nil {
+		t.Fatalf("dry run removed orphan: %v", err)
+	} else {
+		_ = f.Close()
+	}
+
+	report, err := m.Recover(context.Background(), 64, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Kept != 1 || report.Cancelled != 2 || report.Orphans != 1 {
+		t.Fatalf("report = %#v", report)
+	}
+	if _, err := repo.UploadSessionByID(context.Background(), active.ID); err != nil {
+		t.Fatalf("active session removed: %v", err)
+	}
+	for _, id := range []string{"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "cccccccccccccccccccccccccccccccc"} {
+		if _, err := repo.UploadSessionByID(context.Background(), id); !errors.Is(err, db.ErrNotFound) {
+			t.Fatalf("%s not cleaned: %v", id, err)
+		}
+	}
+	if _, err := store.OpenStaging("staging/oooooooooooooooooooooooooooooooo.part"); err == nil {
+		t.Fatal("orphan staging retained")
+	}
+}
+
+func TestRecoverCapsScanAt64(t *testing.T) {
+	root := t.TempDir()
+	store, err := storage.NewObjectStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	repo, err := db.Open(context.Background(), root+"/meta.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	for i := 0; i < 65; i++ {
+		f, err := store.CreateStaging(fmt.Sprintf("staging/%032x.part", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	report, err := New(repo, store, 1, time.Hour).Recover(context.Background(), 999, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Checked != 64 || report.Orphans != 64 {
+		t.Fatalf("bounded report = %#v", report)
+	}
+}
+
+func TestRecoverReportsStorageErrors(t *testing.T) {
+	root := t.TempDir()
+	store, err := storage.NewObjectStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := db.Open(context.Background(), root+"/meta.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(repo, store, 1, time.Hour).Recover(context.Background(), 64, false); err == nil {
+		t.Fatal("Recover hid storage error")
+	}
 }

@@ -158,38 +158,54 @@ func (m *Manager) Write(ctx context.Context, id string, offset int64, body io.Re
 	return next, err
 }
 
-// Complete validates the immutable staged inode, publishes it atomically, then
-// commits metadata and session deletion in one short compare-and-swap DB transaction.
+// Complete hashes under a lifecycle flock, then deliberately releases and
+// reacquires it before publication. Hashing/fsync can take long enough for
+// expiry cleanup in another process to win; the second critical section uses a
+// fresh DB snapshot and the DB transaction repeats the expiry CAS.
 func (m *Manager) Complete(ctx context.Context, id, expectedSHA256 string) error {
-	return m.withLifecycleLock(ctx, id, func(s db.UploadSession) error {
+	var sum [sha256.Size]byte
+	if err := m.withLifecycleLock(ctx, id, func(s db.UploadSession) error {
 		if s.Status != "active" || !s.ExpiresAt.After(time.Now()) {
 			return db.ErrNotFound
 		}
 		if s.Offset != s.Length {
 			return ErrIncomplete
 		}
-		n, sum, err := m.store.HashAndSyncStaging(s.StagingPath)
+		n, hash, err := m.store.HashAndSyncStaging(s.StagingPath)
 		if err != nil {
 			return err
 		}
 		if n != s.Length {
 			return ErrIncomplete
 		}
-		if expectedSHA256 != "" {
-			want, err := hex.DecodeString(expectedSHA256)
-			if err != nil || len(want) != sha256.Size || !equalHash(sum[:], want) {
-				return ErrChecksum
-			}
+		sum = hash
+		return nil
+	}); err != nil {
+		return err
+	}
+	if expectedSHA256 != "" {
+		want, err := hex.DecodeString(expectedSHA256)
+		if err != nil || len(want) != sha256.Size || !equalHash(sum[:], want) {
+			return ErrChecksum
+		}
+	}
+	return m.withLifecycleLock(ctx, id, func(s db.UploadSession) error {
+		// This is intentionally a new lock acquisition and metadata read after
+		// HashAndSyncStaging. Never publish based on the pre-hash snapshot.
+		if s.Status != "active" || !s.ExpiresAt.After(time.Now()) {
+			return db.ErrNotFound
+		}
+		if s.Offset != s.Length {
+			return ErrIncomplete
 		}
 		key, err := m.store.PublishStaging(s.StagingPath)
 		if err != nil {
 			return err
 		}
-		// Publish precedes metadata. If the DB commit fails, the object is an
-		// unreachable orphan; never a listing-visible half completion.
+		// The DB transaction is the final active-and-unexpired CAS. On a failed
+		// CAS, atomically restore both retryable staging data and its row's
+		// expected staging pathname before returning the conflict.
 		if err := m.repo.CompleteUpload(ctx, db.File{RootID: s.RootID, LogicalPath: s.LogicalPath, ObjectKey: key, Size: s.Length, CreatedByUserID: s.UserID}, s.ID); err != nil {
-			// Do not leave an active row pointing at a vanished part after a DB
-			// failure. Roll the atomic publish back while holding its lifecycle lock.
 			if restoreErr := m.store.RestorePublished(key, s.StagingPath); restoreErr != nil {
 				return fmt.Errorf("complete metadata: %w (restore staging: %v)", err, restoreErr)
 			}
@@ -299,34 +315,63 @@ func (m *Manager) Recover(ctx context.Context, limit int, dryRun bool) (Recovery
 		id := strings.TrimSuffix(strings.TrimPrefix(name, "staging/"), ".part")
 		s, err := m.repo.UploadSessionByID(ctx, id)
 		if errors.Is(err, db.ErrNotFound) {
-			if !dryRun {
-				if err := m.store.RemoveStaging(name); err != nil {
-					return report, err
-				}
+			// An orphan has no row from which withLifecycleLock can derive its
+			// pathname. Lock its stable sidecar and re-check DB before unlinking,
+			// so a concurrent creator/recovery cannot lose a newly-live part.
+			lock, lockErr := m.store.LockStagingLifecycle(name)
+			if lockErr != nil {
+				return report, lockErr
 			}
-			report.Orphans++
+			_, checkErr := m.repo.UploadSessionByID(ctx, id)
+			if errors.Is(checkErr, db.ErrNotFound) {
+				if !dryRun {
+					checkErr = m.store.RemoveStaging(name)
+				}
+				report.Orphans++
+			}
+			unlockErr := m.store.UnlockStagingLifecycle(lock)
+			if checkErr != nil && !errors.Is(checkErr, db.ErrNotFound) {
+				return report, checkErr
+			}
+			if unlockErr != nil {
+				return report, unlockErr
+			}
 			continue
 		}
 		if err != nil {
 			return report, err
 		}
-		f, err := m.store.OpenStaging(s.StagingPath)
-		valid := err == nil
-		if valid {
-			info, statErr := f.Stat()
-			_ = f.Close()
-			valid = statErr == nil && info.Mode().IsRegular() && info.Size() == s.Offset
-		}
-		if s.Status == "active" && s.ExpiresAt.After(time.Now()) && valid {
-			report.Kept++
+		var kept bool
+		err = m.withLifecycleLock(ctx, s.ID, func(locked db.UploadSession) error {
+			f, openErr := m.store.OpenStaging(locked.StagingPath)
+			valid := openErr == nil
+			if valid {
+				info, statErr := f.Stat()
+				_ = f.Close()
+				valid = statErr == nil && info.Mode().IsRegular() && info.Size() == locked.Offset
+			}
+			if locked.Status == "active" && locked.ExpiresAt.After(time.Now()) && valid {
+				kept = true
+				return nil
+			}
+			if dryRun {
+				return nil
+			}
+			return m.cleanupLocked(ctx, locked)
+		})
+		if errors.Is(err, db.ErrNotFound) {
+			// A competing cleanup already converged; the part is not live.
+			report.Cancelled++
 			continue
 		}
-		if !dryRun {
-			if err := m.cleanup(ctx, s.ID, false); err != nil && !errors.Is(err, db.ErrNotFound) {
-				return report, err
-			}
+		if err != nil {
+			return report, err
 		}
-		report.Cancelled++
+		if kept {
+			report.Kept++
+		} else {
+			report.Cancelled++
+		}
 	}
 	return report, nil
 }

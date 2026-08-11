@@ -121,3 +121,30 @@ func assertWAL(t *testing.T, databasePath string) {
 		t.Fatalf("SQLite journal mode = %q, want wal", journalMode)
 	}
 }
+
+func TestCompleteUploadRejectsExpiredActiveSessionWithoutCreatingFile(t *testing.T) {
+	ctx := context.Background()
+	repo, err := db.Open(ctx, filepath.Join(t.TempDir(), "metadata.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	u, err := repo.CreateUser(ctx, db.User{Username: "complete-expired", PasswordHash: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := repo.CreateStorageRoot(ctx, db.StorageRoot{Name: "complete-expired", Path: "/tmp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.CreateUploadSession(ctx, db.UploadSession{ID: "expired-complete", UserID: u.ID, RootID: r.ID, LogicalPath: "/expired", StagingPath: "staging/expired-complete.part", Length: 1, Offset: 1, ExpiresAt: time.Now().Add(-time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	err = repo.CompleteUpload(ctx, db.File{RootID: r.ID, LogicalPath: "/expired", ObjectKey: "objects/aa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Size: 1, CreatedByUserID: u.ID}, "expired-complete")
+	if !errors.Is(err, db.ErrConflict) {
+		t.Fatalf("CompleteUpload error = %v, want ErrConflict", err)
+	}
+	if _, err := repo.FileByRootAndPath(ctx, r.ID, "/expired"); !errors.Is(err, db.ErrNotFound) {
+		t.Fatalf("expired completion made file visible: %v", err)
+	}
+}

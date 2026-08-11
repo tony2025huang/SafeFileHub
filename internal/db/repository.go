@@ -302,7 +302,7 @@ func (r *Repository) CompleteUpload(ctx context.Context, file File, sessionID st
 		return fmt.Errorf("begin complete upload: %w", err)
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `DELETE FROM upload_sessions WHERE id = ? AND status = 'active'`, sessionID)
+	result, err := tx.ExecContext(ctx, `DELETE FROM upload_sessions WHERE id = ? AND status = 'active' AND expires_at > ?`, sessionID, unixNano(time.Now().UTC()))
 	if err != nil {
 		return fmt.Errorf("delete completed upload session: %w", err)
 	}
