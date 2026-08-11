@@ -158,6 +158,30 @@ func (r *Repository) FileByRootAndPath(ctx context.Context, rootID int64, logica
 	return file, nil
 }
 
+// FilesUnderRoot returns completed-file metadata candidates. Callers must
+// apply authorization and logical-name policy before exposing any entry.
+func (r *Repository) FilesUnderRoot(ctx context.Context, rootID int64) ([]File, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT id, root_id, logical_path, object_key, size, created_by_user_id, created_at, updated_at FROM files WHERE root_id = ? ORDER BY logical_path`, rootID)
+	if err != nil {
+		return nil, fmt.Errorf("query files under root: %w", err)
+	}
+	defer rows.Close()
+	var files []File
+	for rows.Next() {
+		var file File
+		var createdAt, updatedAt int64
+		if err := rows.Scan(&file.ID, &file.RootID, &file.LogicalPath, &file.ObjectKey, &file.Size, &file.CreatedByUserID, &createdAt, &updatedAt); err != nil {
+			return nil, fmt.Errorf("scan file: %w", err)
+		}
+		file.CreatedAt, file.UpdatedAt = fromUnixNano(createdAt), fromUnixNano(updatedAt)
+		files = append(files, file)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate files under root: %w", err)
+	}
+	return files, nil
+}
+
 func (r *Repository) CreatePermission(ctx context.Context, permission Permission) (Permission, error) {
 	action := normalizeAction(permission.Action)
 	if action == "" {
