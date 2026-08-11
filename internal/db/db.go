@@ -49,7 +49,11 @@ func sqliteDSN(databasePath string) string {
 	if strings.Contains(databasePath, "?") {
 		separator = "&"
 	}
-	return databasePath + separator + "_pragma=foreign_keys(ON)"
+	// A bounded busy timeout lets independent HTTP processes and pooled
+	// connections serialize short SQLite write transactions rather than turning
+	// ordinary contention into an immediate 500 response. It is a DSN pragma so
+	// it applies to every pooled connection, just like foreign_keys.
+	return databasePath + separator + "_pragma=foreign_keys(ON)&_pragma=busy_timeout(30000)"
 }
 
 func (r *Repository) configure(ctx context.Context) error {

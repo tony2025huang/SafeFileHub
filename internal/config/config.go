@@ -44,6 +44,11 @@ type Config struct {
 	// AdminUsernames identifies the small bootstrap set permitted to manage
 	// users and scoped permissions. Authentication remains session-based.
 	AdminUsernames []string
+	// TrustedProxyCIDRs authorizes direct reverse-proxy peers to supply client IP headers.
+	TrustedProxyCIDRs []string
+	LogPath           string
+	LogFormat         string
+	LogRetentionDays  int
 }
 
 func Default() Config {
@@ -104,6 +109,12 @@ func (c Config) Validate() error {
 	}
 	if c.RequestIdleTimeout <= 0 {
 		return fmt.Errorf("request idle timeout must be positive")
+	}
+	if c.LogFormat != "" && c.LogFormat != "json" && c.LogFormat != "text" {
+		return fmt.Errorf("log format must be json or text")
+	}
+	if c.LogRetentionDays < 0 {
+		return fmt.Errorf("log retention days must not be negative")
 	}
 	return nil
 }

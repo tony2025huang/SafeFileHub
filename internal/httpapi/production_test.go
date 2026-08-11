@@ -58,7 +58,7 @@ func TestNewProductionServerRouteContract(t *testing.T) {
 		{"GET", "/healthz"}, {"GET", "/readyz"}, {"GET", "/metrics"}, {"GET", "/"},
 		{"POST", "/login"}, {"POST", "/logout"}, {"GET", "/session"},
 		{"GET", "/roots/1/files"}, {"POST", "/api/uploads"}, {"HEAD", "/api/uploads/x"}, {"PATCH", "/api/uploads/x"}, {"DELETE", "/api/uploads/x"}, {"POST", "/api/uploads/x/complete"},
-		{"GET", "/api/files/1"}, {"POST", "/api/roots/1/archives"}, {"GET", "/api/archives/x"}, {"DELETE", "/api/archives/x"}, {"GET", "/api/admin/audit"},
+		{"GET", "/api/files/1"}, {"POST", "/api/files"}, {"POST", "/api/roots/1/archives"}, {"GET", "/api/archives/x"}, {"DELETE", "/api/archives/x"}, {"GET", "/api/admin/audit"},
 	} {
 		r := httptest.NewRequest(route.method, route.path, nil)
 		w := httptest.NewRecorder()

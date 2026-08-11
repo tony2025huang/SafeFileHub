@@ -80,7 +80,7 @@ func newServerWithUploads(cfg config.Config, users authenticator, sessions sessi
 	// The production constructor composes the Task 5 listing surface with
 	// upload endpoints, rather than replacing it with an upload-only mux.
 	mux.Handle("GET /roots/{rootID}/files", requireSession(sessions, listFiles(repo, authorizer, cfg.NamePolicy)))
-	create := requireSession(sessions, http.HandlerFunc(createUpload(m, repo, authorizer, cfg)))
+	create := requireSession(sessions, logTransferLifecycle("upload", http.HandlerFunc(createUpload(m, repo, authorizer, cfg))))
 	mux.Handle("POST /api/uploads", create)
 	state := requireSession(sessions, http.HandlerFunc(uploadStateWithMetrics(m, authorizer, observability)))
 	patchHandler := http.Handler(UploadBodyLimits(cfg.UploadIdleTimeout, cfg.MaxRequestBodyBytes, http.HandlerFunc(patchUpload(m, authorizer))))
@@ -89,11 +89,11 @@ func newServerWithUploads(cfg config.Config, users authenticator, sessions sessi
 	} else {
 		patchHandler = LimitUpload(limiter, time.Second, sessionUploadIdentity, patchHandler)
 	}
-	patch := requireSession(sessions, patchHandler)
+	patch := requireSession(sessions, logTransferLifecycle("upload", patchHandler))
 	mux.Handle("HEAD /api/uploads/{id}", state)
 	mux.Handle("DELETE /api/uploads/{id}", state)
 	mux.Handle("PATCH /api/uploads/{id}", patch)
-	complete := requireSession(sessions, http.HandlerFunc(completeUpload(m, authorizer)))
+	complete := requireSession(sessions, logTransferLifecycle("upload", http.HandlerFunc(completeUpload(m, authorizer))))
 	mux.Handle("POST /api/uploads/{id}/complete", complete)
 	if observability != nil {
 		return observedHandler(cfg, mux, observability), nil

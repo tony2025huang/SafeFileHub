@@ -25,3 +25,8 @@ UMask=0077
 
 [Install]
 WantedBy=multi-user.target
+
+# Logging/reverse proxy example (append flags to ExecStart as appropriate):
+# --log-path=/var/log/safefilehub/app.json --log-format=json --log-retention-days=30 \
+# --trusted-proxy-cidr=127.0.0.1/32 --trusted-proxy-cidr=::1/128
+# Keep WorkingDirectory/data on persistent disk; do not use tmpfs for production data.

@@ -33,6 +33,7 @@ SafeFileHub 是一个基于 Go 的安全文件传输服务，面向需要认证�
 - `GET /roots/{rootID}/files`：授权后的逻辑文件列表。
 - 上传 API：创建 session、`HEAD` offset、`PATCH` 分块、取消和完成。
 - `GET|HEAD /api/files/{fileID}`：流式文件下载与 Range 请求。
+- `POST /api/directories`：创建显式空目录；`DELETE /api/files/{fileID}`、`DELETE /api/directories/{directoryID}`：删除已发布对象（目录仅非递归删除）。
 - 归档 API：创建、下载和取消临时目录归档任务。
 - `/api/admin/*`：管理员用户、密码、禁用状态和 scoped permission 管理。
 
@@ -194,3 +195,11 @@ Docker 默认 `json-file` logging driver 的宿主机日志文件通常是 `/var
 ## 许可证与贡献
 
 本仓库当前主要用于受控环境中的工程验证。提交代码前请运行完整 race、vet、coverage、前端测试和 build；涉及权限、路径、上传、下载、归档或部署配置的改动必须补充回归测试。
+
+### Initial administrator and logging
+
+On the first start against an empty database, SafeFileHub creates a random `sfh-…` administrator username and a high-entropy password. The credentials are emitted **once** to the process initialization log; retain them securely. Passwords are stored only as Argon2id hashes. Normal restarts do not rotate the account.
+
+To recover access, run the service binary with `--reset-initial-admin`. It resets only `users.id=1`, enables it, prints a fresh random username/password, and exits without serving HTTP. It accepts no password argument and fails if id 1 is absent.
+
+Use `--log-path`, `--log-format=json|text`, and `--log-retention-days` for production log configuration. Application logs deliberately omit passwords, cookies, Authorization headers, request/file contents, tokens, and query values. When reverse-proxying, configure `trusted-proxy-cidr` only for actual proxy networks; untrusted forwarded headers are ignored.

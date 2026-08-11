@@ -189,7 +189,16 @@ func requireSession(sessions sessionManager, next http.Handler) http.Handler {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), sessionUserIDKey{}, userID)))
+		ctx := context.WithValue(r.Context(), sessionUserIDKey{}, userID)
+		// Correlate session activity without recording the bearer cookie itself.
+		auditID := sessionAuditToken(cookie.Value)
+		ctx = context.WithValue(ctx, sessionAuditIDKey{}, auditID)
+		// The outer terminal request logger sees the original request context, so
+		// retain only safe correlation data in its request-scoped shared state.
+		if state, _ := r.Context().Value(requestAuditStateKey{}).(*requestAuditState); state != nil {
+			state.userID, state.sessionAuditID = userID, auditID
+		}
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 

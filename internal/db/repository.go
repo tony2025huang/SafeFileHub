@@ -44,6 +44,15 @@ type File struct {
 	UpdatedAt       time.Time
 }
 
+type Directory struct {
+	ID              int64
+	RootID          int64
+	LogicalPath     string
+	CreatedByUserID int64
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
 type Permission struct {
 	ID         int64
 	UserID     int64
@@ -68,6 +77,8 @@ type UploadSession struct {
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }
+
+type ObjectCleanupJob struct{ ObjectKey, Reason string }
 
 type AuditEvent struct {
 	ID          int64
@@ -127,6 +138,22 @@ func (r *Repository) UpdateUserCredentials(ctx context.Context, id int64, passwo
 	return nil
 }
 
+// ResetInitialAdmin atomically replaces only user id 1 credentials and identity.
+func (r *Repository) ResetInitialAdmin(ctx context.Context, username, passwordHash string) error {
+	result, err := r.db.ExecContext(ctx, `UPDATE users SET username=?, password_hash=?, disabled=0, updated_at=? WHERE id=1`, username, passwordHash, unixNano(time.Now().UTC()))
+	if err != nil {
+		return classifyError(err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (r *Repository) CreateStorageRoot(ctx context.Context, root StorageRoot) (StorageRoot, error) {
 	createdAt := utcOrNow(root.CreatedAt)
 	updatedAt := utcOrNow(root.UpdatedAt)
@@ -178,7 +205,7 @@ func (r *Repository) CreateFile(ctx context.Context, file File) (File, error) {
 func (r *Repository) FileByID(ctx context.Context, id int64) (File, error) {
 	var file File
 	var createdAt, updatedAt int64
-	err := r.db.QueryRowContext(ctx, `SELECT id, root_id, logical_path, object_key, size, created_by_user_id, created_at, updated_at FROM files WHERE id = ?`, id).Scan(&file.ID, &file.RootID, &file.LogicalPath, &file.ObjectKey, &file.Size, &file.CreatedByUserID, &createdAt, &updatedAt)
+	err := r.db.QueryRowContext(ctx, `SELECT id, root_id, logical_path, object_key, size, created_by_user_id, created_at, updated_at FROM files WHERE id = ? AND delete_state = 'active'`, id).Scan(&file.ID, &file.RootID, &file.LogicalPath, &file.ObjectKey, &file.Size, &file.CreatedByUserID, &createdAt, &updatedAt)
 	if err != nil {
 		return File{}, classifyError(err)
 	}
@@ -186,15 +213,180 @@ func (r *Repository) FileByID(ctx context.Context, id int64) (File, error) {
 	return file, nil
 }
 
+// FileForDeletion includes tombstones only for recovery. Readers use FileByID.
+func (r *Repository) FileForDeletion(ctx context.Context, id int64) (File, error) {
+	var f File
+	var created, updated int64
+	err := r.db.QueryRowContext(ctx, `SELECT id, root_id, logical_path, object_key, size, created_by_user_id, created_at, updated_at FROM files WHERE id = ?`, id).Scan(&f.ID, &f.RootID, &f.LogicalPath, &f.ObjectKey, &f.Size, &f.CreatedByUserID, &created, &updated)
+	if err != nil {
+		return File{}, classifyError(err)
+	}
+	f.CreatedAt, f.UpdatedAt = fromUnixNano(created), fromUnixNano(updated)
+	return f, nil
+}
+
 func (r *Repository) FileByRootAndPath(ctx context.Context, rootID int64, logicalPath string) (File, error) {
 	var file File
 	var createdAt, updatedAt int64
-	err := r.db.QueryRowContext(ctx, `SELECT id, root_id, logical_path, object_key, size, created_by_user_id, created_at, updated_at FROM files WHERE root_id = ? AND logical_path = ?`, rootID, logicalPath).Scan(&file.ID, &file.RootID, &file.LogicalPath, &file.ObjectKey, &file.Size, &file.CreatedByUserID, &createdAt, &updatedAt)
+	err := r.db.QueryRowContext(ctx, `SELECT id, root_id, logical_path, object_key, size, created_by_user_id, created_at, updated_at FROM files WHERE root_id = ? AND logical_path = ? AND delete_state = 'active'`, rootID, logicalPath).Scan(&file.ID, &file.RootID, &file.LogicalPath, &file.ObjectKey, &file.Size, &file.CreatedByUserID, &createdAt, &updatedAt)
 	if err != nil {
 		return File{}, classifyError(err)
 	}
 	file.CreatedAt, file.UpdatedAt = fromUnixNano(createdAt), fromUnixNano(updatedAt)
 	return file, nil
+}
+
+// BeginFileDelete tombstones the exact id/key pair before object deletion.
+func (r *Repository) BeginFileDelete(ctx context.Context, id int64, key string) error {
+	result, err := r.db.ExecContext(ctx, `UPDATE files SET delete_state='deleting', updated_at=? WHERE id=? AND object_key=? AND delete_state='active'`, unixNano(time.Now().UTC()), id, key)
+	if err != nil {
+		return fmt.Errorf("tombstone file: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return ErrNotFound
+	}
+	return nil
+}
+func (r *Repository) FinalizeFileDelete(ctx context.Context, id int64, key string) error {
+	result, err := r.db.ExecContext(ctx, `DELETE FROM files WHERE id=? AND object_key=? AND delete_state='deleting'`, id, key)
+	if err != nil {
+		return fmt.Errorf("finalize file delete: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// EnqueueObjectCleanup durably remembers failed publication compensation.
+func (r *Repository) EnqueueObjectCleanup(ctx context.Context, key, reason string) error {
+	now := unixNano(time.Now().UTC())
+	_, err := r.db.ExecContext(ctx, `INSERT INTO object_cleanup_jobs(object_key,reason,created_at,updated_at) VALUES(?,?,?,?) ON CONFLICT(object_key) DO UPDATE SET updated_at=excluded.updated_at`, key, reason, now, now)
+	return err
+}
+func (r *Repository) CompleteObjectCleanup(ctx context.Context, key string) error {
+	_, err := r.db.ExecContext(ctx, `DELETE FROM object_cleanup_jobs WHERE object_key=?`, key)
+	return err
+}
+
+// ObjectCleanupJobs and DeletingFiles are bounded startup-maintenance snapshots.
+func (r *Repository) ObjectCleanupJobs(ctx context.Context, limit int) ([]ObjectCleanupJob, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT object_key, reason FROM object_cleanup_jobs ORDER BY created_at LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ObjectCleanupJob
+	for rows.Next() {
+		var j ObjectCleanupJob
+		if err := rows.Scan(&j.ObjectKey, &j.Reason); err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+func (r *Repository) DeletingFiles(ctx context.Context, limit int) ([]File, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT id, root_id, logical_path, object_key, size, created_by_user_id, created_at, updated_at FROM files WHERE delete_state='deleting' ORDER BY id LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []File
+	for rows.Next() {
+		var f File
+		var c, u int64
+		if err := rows.Scan(&f.ID, &f.RootID, &f.LogicalPath, &f.ObjectKey, &f.Size, &f.CreatedByUserID, &c, &u); err != nil {
+			return nil, err
+		}
+		f.CreatedAt, f.UpdatedAt = fromUnixNano(c), fromUnixNano(u)
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// DirectoryByRootAndPath finds one explicitly-created directory. The root
+// itself is represented by StorageRoot rather than a directories row.
+func (r *Repository) DirectoryByRootAndPath(ctx context.Context, rootID int64, logicalPath string) (Directory, error) {
+	var d Directory
+	var createdAt, updatedAt int64
+	err := r.db.QueryRowContext(ctx, `SELECT id, root_id, logical_path, created_by_user_id, created_at, updated_at FROM directories WHERE root_id = ? AND logical_path = ?`, rootID, logicalPath).Scan(&d.ID, &d.RootID, &d.LogicalPath, &d.CreatedByUserID, &createdAt, &updatedAt)
+	if err != nil {
+		return Directory{}, classifyError(err)
+	}
+	d.CreatedAt, d.UpdatedAt = fromUnixNano(createdAt), fromUnixNano(updatedAt)
+	return d, nil
+}
+
+// DeleteFile deletes exactly one published-file metadata row. The service removes
+// the opaque object first, avoiding dangling database references.
+func (r *Repository) DeleteFile(ctx context.Context, id int64) error {
+	result, err := r.db.ExecContext(ctx, `DELETE FROM files WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete file: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("confirm file delete: %w", err)
+	}
+	if n != 1 {
+		return ErrNotFound
+	}
+	return nil
+}
+func (r *Repository) CreateDirectory(ctx context.Context, d Directory) (Directory, error) {
+	created, updated := utcOrNow(d.CreatedAt), utcOrNow(d.UpdatedAt)
+	if d.UpdatedAt.IsZero() {
+		updated = created
+	}
+	result, err := r.db.ExecContext(ctx, `INSERT INTO directories (root_id, logical_path, created_by_user_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`, d.RootID, d.LogicalPath, d.CreatedByUserID, unixNano(created), unixNano(updated))
+	if err != nil {
+		return Directory{}, classifyError(err)
+	}
+	d.ID, err = result.LastInsertId()
+	if err != nil {
+		return Directory{}, fmt.Errorf("get created directory id: %w", err)
+	}
+	d.CreatedAt, d.UpdatedAt = created, updated
+	return d, nil
+}
+func (r *Repository) DirectoryByID(ctx context.Context, id int64) (Directory, error) {
+	var d Directory
+	var created, updated int64
+	err := r.db.QueryRowContext(ctx, `SELECT id, root_id, logical_path, created_by_user_id, created_at, updated_at FROM directories WHERE id = ?`, id).Scan(&d.ID, &d.RootID, &d.LogicalPath, &d.CreatedByUserID, &created, &updated)
+	if err != nil {
+		return Directory{}, classifyError(err)
+	}
+	d.CreatedAt, d.UpdatedAt = fromUnixNano(created), fromUnixNano(updated)
+	return d, nil
+}
+func (r *Repository) DirectoryEmpty(ctx context.Context, d Directory) (bool, error) {
+	prefix := d.LogicalPath + "/"
+	var exists bool
+	err := r.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM files WHERE root_id=? AND substr(logical_path, 1, length(?)) = ? UNION ALL SELECT 1 FROM directories WHERE root_id=? AND substr(logical_path, 1, length(?)) = ?)`, d.RootID, prefix, prefix, d.RootID, prefix, prefix).Scan(&exists)
+	return !exists, err
+}
+func (r *Repository) DeleteDirectory(ctx context.Context, id int64) error {
+	result, err := r.db.ExecContext(ctx, `DELETE FROM directories WHERE id = ?`, id)
+	if err != nil {
+		return classifyError(err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("confirm directory delete: %w", err)
+	}
+	if n != 1 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // FilesUnderRoot returns completed-file metadata candidates. Callers must
@@ -438,7 +630,7 @@ func redactAuditDetail(detail string) string {
 		if strings.HasPrefix(lower, "password=") || strings.HasPrefix(lower, "content=") || strings.HasPrefix(lower, "token=") || strings.HasPrefix(lower, "secret=") || strings.HasPrefix(lower, "authorization=") {
 			continue
 		}
-		if strings.HasPrefix(lower, "status=") || strings.HasPrefix(lower, "target_user_id=") {
+		if strings.HasPrefix(lower, "status=") || strings.HasPrefix(lower, "target_user_id=") || strings.HasPrefix(lower, "request_id=") || strings.HasPrefix(lower, "session_audit_id=") || strings.HasPrefix(lower, "result=") {
 			kept = append(kept, field)
 		}
 	}
@@ -536,7 +728,9 @@ func classifyError(err error) error {
 		return ErrNotFound
 	}
 	message := strings.ToLower(err.Error())
-	if strings.Contains(message, "unique constraint") || strings.Contains(message, "constraint failed") {
+	if strings.Contains(message, "unique constraint") || strings.Contains(message, "constraint failed") ||
+		strings.Contains(message, "published path occupied") || strings.Contains(message, "directory not empty") ||
+		strings.Contains(message, "parent directory not found") {
 		return fmt.Errorf("%w: %v", ErrConflict, err)
 	}
 	return err

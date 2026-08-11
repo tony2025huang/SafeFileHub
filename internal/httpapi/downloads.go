@@ -67,7 +67,7 @@ func newServerWithDownloads(cfg config.Config, users authenticator, sessions ses
 	} else {
 		download = limitDownload(limiter, download)
 	}
-	downloadHandler := requireSession(sessions, download)
+	downloadHandler := requireSession(sessions, logTransferLifecycle("download", download))
 	m.Handle("GET /api/files/{fileID}", downloadHandler)
 	m.Handle("HEAD /api/files/{fileID}", downloadHandler)
 	if observability != nil {

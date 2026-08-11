@@ -8,11 +8,13 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/example/safefilehub/internal/archive"
 	"github.com/example/safefilehub/internal/config"
 	"github.com/example/safefilehub/internal/db"
 	"github.com/example/safefilehub/internal/metrics"
+	appLog "github.com/example/safefilehub/internal/observability"
 	"github.com/example/safefilehub/internal/pathpolicy"
 )
 
@@ -56,8 +58,11 @@ func newServerWithArchives(cfg config.Config, users authenticator, sessions sess
 		create = observeArchive(observability, create)
 		download = observeArchive(observability, download)
 	}
+	// Archive creation gets its lifecycle records inside createArchive, after the
+	// manager returns the durable job ID. Unlike archive downloads, the request
+	// path does not contain that ID before the handler runs.
 	m.Handle("POST /api/roots/{rootID}/archives", requireSession(sessions, create))
-	m.Handle("GET /api/archives/{jobID}", requireSession(sessions, download))
+	m.Handle("GET /api/archives/{jobID}", requireSession(sessions, logTransferLifecycle("archive", download)))
 	cancel := http.Handler(http.HandlerFunc(cancelArchive(manager)))
 	if observability != nil {
 		cancel = observeCancellation(observability, cancel)
@@ -111,6 +116,7 @@ func createArchive(repo archiveRepository, auth archiveAuthorizer, manager *arch
 				entries = append(entries, archive.Entry{LogicalPath: f.LogicalPath, ObjectKey: f.ObjectKey, Size: f.Size})
 			}
 		}
+		started := time.Now()
 		job, err := manager.CreateForUser(r.Context(), uid, p.Canonical, entries, archiveHTTPAuthorizer{ctx: r.Context(), auth: auth, uid: uid, rootID: rootID})
 		if errors.Is(err, archive.ErrForbidden) {
 			http.Error(w, "forbidden", 403)
@@ -120,6 +126,10 @@ func createArchive(repo archiveRepository, auth archiveAuthorizer, manager *arch
 			http.Error(w, "cannot create archive", 400)
 			return
 		}
+		// Job creation is the first point at which archive correlation can use a
+		// stable identifier. Log the paired lifecycle records here rather than
+		// assigning a request-scoped placeholder before calling the manager.
+		logArchiveCreated(r, job.ID, time.Since(started))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(struct {
@@ -137,6 +147,34 @@ type archiveHTTPAuthorizer struct {
 func (a archiveHTTPAuthorizer) Allow(_ context.Context, p string) (bool, error) {
 	return a.auth.Authorize(a.ctx, a.uid, a.rootID, p, "archive")
 }
+
+// logArchiveCreated writes the archive lifecycle only after a durable job ID
+// exists. It intentionally leaves failed creation to the enclosing request log:
+// a failed attempt has no transfer to correlate.
+func logArchiveCreated(r *http.Request, jobID string, elapsed time.Duration) {
+	logger, _ := r.Context().Value(applicationLoggerKey{}).(*appLog.MultiLogger)
+	if logger == nil || jobID == "" {
+		return
+	}
+	base := appLog.Event{
+		Level:          "info",
+		ClientIP:       requestClientIP(r),
+		PeerIP:         peerIP(r),
+		UserID:         userID(r),
+		RequestID:      requestID(r),
+		SessionAuditID: sessionAuditID(r),
+		TransferID:     "archive-" + jobID,
+		Route:          r.URL.Path,
+	}
+	base.Operation = "archive.start"
+	logger.Log(base)
+	base.Operation = "archive.complete"
+	base.Status = http.StatusAccepted
+	base.Success = true
+	base.DurationMS = elapsed.Milliseconds()
+	logger.Log(base)
+}
+
 func downloadArchive(manager *archive.Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid, _ := r.Context().Value(sessionUserIDKey{}).(int64)

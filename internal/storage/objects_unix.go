@@ -111,6 +111,32 @@ func (s *ObjectStore) Create(logicalPath string) (string, io.WriteCloser, error)
 	return key, os.NewFile(uintptr(fd), key), nil
 }
 
+// CreateEmpty creates a durable zero-byte opaque object. It is used for the
+// published-file creation path, where returning metadata before the object's
+// contents are stable would leave a dangling reference after a crash.
+func (s *ObjectStore) CreateEmpty(logicalPath string) (key string, err error) {
+	key, writer, err := s.Create(logicalPath)
+	if err != nil {
+		return "", err
+	}
+	f, ok := writer.(*os.File)
+	if !ok {
+		_ = writer.Close()
+		_ = s.Remove(key)
+		return "", fmt.Errorf("created object is not a file")
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = s.Remove(key)
+		return "", fmt.Errorf("sync empty object: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = s.Remove(key)
+		return "", fmt.Errorf("close empty object: %w", err)
+	}
+	return key, nil
+}
+
 // Open opens only a validated opaque object key below the physical root.
 func (s *ObjectStore) Open(key string) (*os.File, error) {
 	rootFD, err := s.rootFD()
@@ -194,6 +220,30 @@ func isLowerHex(value string) bool {
 		}
 	}
 	return true
+}
+
+// Remove deletes a validated opaque object. Every directory lookup is descriptor
+// relative and no symlink is followed.
+func (s *ObjectStore) Remove(key string) error {
+	rootFD, err := s.rootFD()
+	if err != nil {
+		return err
+	}
+	defer unix.Close(rootFD)
+	_, name, err := parseObjectKey(key)
+	if err != nil {
+		return err
+	}
+	objects, shard, err := objectDirectory(rootFD, key, false)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(objects)
+	defer unix.Close(shard)
+	if err := unix.Unlinkat(shard, name, 0); err != nil {
+		return fmt.Errorf("remove object: %w", err)
+	}
+	return unix.Fsync(shard)
 }
 
 // CreateStaging creates a private resumable-upload staging file below the

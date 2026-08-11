@@ -32,6 +32,10 @@ func (s *ObjectStore) Create(logicalPath string) (string, io.WriteCloser, error)
 	return "", nil, ErrUnsupportedPlatform
 }
 
+func (s *ObjectStore) CreateEmpty(logicalPath string) (string, error) {
+	return "", ErrUnsupportedPlatform
+}
+
 // Open always returns ErrUnsupportedPlatform on Windows.
 func (s *ObjectStore) Open(key string) (*os.File, error) {
 	return nil, ErrUnsupportedPlatform

@@ -55,6 +55,7 @@ func NewProductionServer(cfg config.Config, users authenticator, sessions userSe
 	downloadRepository
 	archiveRepository
 	adminRepository
+	publishedRepository
 }, authorizer interface {
 	uploadAuthorizer
 	downloadAuthorizer
@@ -80,18 +81,23 @@ func NewProductionServer(cfg config.Config, users authenticator, sessions userSe
 	mux.HandleFunc("POST /logout", logout(sessions))
 	mux.Handle("GET /session", requireSession(sessions, http.HandlerFunc(sessionStatus)))
 	mux.Handle("GET /roots/{rootID}/files", requireSession(sessions, listFiles(repo, authorizer, cfg.NamePolicy)))
-	mux.Handle("POST /api/uploads", requireSession(sessions, http.HandlerFunc(createUpload(uploads, repo, authorizer, cfg))))
+	mux.Handle("POST /api/uploads", requireSession(sessions, logTransferLifecycle("upload", http.HandlerFunc(createUpload(uploads, repo, authorizer, cfg)))))
 	state := requireSession(sessions, http.HandlerFunc(uploadStateWithMetrics(uploads, authorizer, observability)))
 	mux.Handle("HEAD /api/uploads/{id}", state)
 	mux.Handle("DELETE /api/uploads/{id}", state)
 	patch := UploadBodyLimits(cfg.UploadIdleTimeout, cfg.MaxRequestBodyBytes, http.HandlerFunc(patchUpload(uploads, authorizer)))
-	mux.Handle("PATCH /api/uploads/{id}", requireSession(sessions, limitUploadWithMetrics(uploadLimiter, time.Second, sessionUploadIdentity, observability, observeUpload(observability, patch))))
-	mux.Handle("POST /api/uploads/{id}/complete", requireSession(sessions, http.HandlerFunc(completeUpload(uploads, authorizer))))
-	download := requireSession(sessions, limitDownloadWithMetrics(downloadLimiter, observability, observeDownload(observability, http.HandlerFunc(downloadFile(repo, authorizer, store)))))
+	mux.Handle("PATCH /api/uploads/{id}", requireSession(sessions, logTransferLifecycle("upload", limitUploadWithMetrics(uploadLimiter, time.Second, sessionUploadIdentity, observability, observeUpload(observability, patch)))))
+	mux.Handle("POST /api/uploads/{id}/complete", requireSession(sessions, logTransferLifecycle("upload", http.HandlerFunc(completeUpload(uploads, authorizer)))))
+	download := requireSession(sessions, logTransferLifecycle("download", limitDownloadWithMetrics(downloadLimiter, observability, observeDownload(observability, http.HandlerFunc(downloadFile(repo, authorizer, store))))))
 	mux.Handle("GET /api/files/{fileID}", download)
+	mux.Handle("POST /api/directories", requireSession(sessions, logTransferLifecycle("directory.create", http.HandlerFunc(createDirectory(repo, authorizer, cfg.NamePolicy)))))
+	mux.Handle("POST /api/files", requireSession(sessions, logTransferLifecycle("file.create", http.HandlerFunc(createEmptyFile(repo, authorizer, cfg.NamePolicy, store)))))
+	mux.Handle("DELETE /api/files/{fileID}", requireSession(sessions, logTransferLifecycle("file.delete", http.HandlerFunc(deleteFile(repo, authorizer, store)))))
+	mux.Handle("DELETE /api/directories/{directoryID}", requireSession(sessions, logTransferLifecycle("directory.delete", http.HandlerFunc(deleteDirectory(repo, authorizer)))))
 	mux.Handle("HEAD /api/files/{fileID}", download)
+	// createArchive logs its archive lifecycle after it receives the durable job ID.
 	mux.Handle("POST /api/roots/{rootID}/archives", requireSession(sessions, observeArchive(observability, http.HandlerFunc(createArchive(repo, authorizer, archives, cfg.NamePolicy)))))
-	mux.Handle("GET /api/archives/{jobID}", requireSession(sessions, observeArchive(observability, http.HandlerFunc(downloadArchive(archives)))))
+	mux.Handle("GET /api/archives/{jobID}", requireSession(sessions, logTransferLifecycle("archive", observeArchive(observability, http.HandlerFunc(downloadArchive(archives))))))
 	mux.Handle("DELETE /api/archives/{jobID}", requireSession(sessions, observeCancellation(observability, http.HandlerFunc(cancelArchive(archives)))))
 	registerAdminRoutes(mux, cfg, sessions, repo)
 	return observedHandler(cfg, mux, observability), nil
