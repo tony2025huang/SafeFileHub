@@ -110,3 +110,24 @@ func testRepository(t *testing.T) *db.Repository {
 	t.Cleanup(func() { _ = repo.Close() })
 	return repo
 }
+
+func TestSessionCookieUsesConfiguredSameSiteAndExpiresWithTTL(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
+	manager := auth.NewSessionManager(auth.NewMemorySessionStore(), auth.SessionConfig{
+		TTL:      90 * time.Minute,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+		Now:      func() time.Time { return now },
+	})
+
+	rr := httptest.NewRecorder()
+	manager.SetCookie(rr, "opaque-server-session-id")
+	cookie := rr.Result().Cookies()[0]
+	if cookie.SameSite != http.SameSiteStrictMode {
+		t.Fatalf("cookie SameSite = %v, want %v", cookie.SameSite, http.SameSiteStrictMode)
+	}
+	if cookie.MaxAge != int((90*time.Minute).Seconds()) || !cookie.Expires.Equal(now.Add(90*time.Minute)) {
+		t.Fatalf("cookie expiry = MaxAge %d, Expires %s; want %d, %s", cookie.MaxAge, cookie.Expires, int((90 * time.Minute).Seconds()), now.Add(90*time.Minute))
+	}
+}

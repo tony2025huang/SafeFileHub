@@ -20,7 +20,9 @@ type Authorizer struct {
 
 func NewAuthorizer(repository interface {
 	PermissionsForUserAndRoot(context.Context, int64, int64) ([]db.Permission, error)
-}, policy config.NamePolicy) *Authorizer { return &Authorizer{repository: repository, policy: policy} }
+}, policy config.NamePolicy) *Authorizer {
+	return &Authorizer{repository: repository, policy: policy}
+}
 
 // Authorize applies permissions for exactly one user, root, canonical logical
 // path, and action. It defaults to deny; the longest matching prefix controls

@@ -29,6 +29,7 @@ type SessionConfig struct {
 	CookieName string
 	TTL        time.Duration
 	Secure     bool
+	SameSite   http.SameSite
 	Now        func() time.Time
 }
 type SessionManager struct {
@@ -42,6 +43,9 @@ func NewSessionManager(store SessionStore, config SessionConfig) *SessionManager
 	}
 	if config.TTL <= 0 {
 		config.TTL = 24 * time.Hour
+	}
+	if config.SameSite == 0 {
+		config.SameSite = http.SameSiteLaxMode
 	}
 	if config.Now == nil {
 		config.Now = time.Now
@@ -72,7 +76,7 @@ func (m *SessionManager) UserID(ctx context.Context, id string) (int64, error) {
 }
 func (m *SessionManager) SetCookie(w http.ResponseWriter, id string) {
 	now := m.config.Now().UTC()
-	http.SetCookie(w, &http.Cookie{Name: m.config.CookieName, Value: id, Path: "/", Expires: now.Add(m.config.TTL), MaxAge: int(m.config.TTL.Seconds()), Secure: m.config.Secure, HttpOnly: true, SameSite: http.SameSiteLaxMode})
+	http.SetCookie(w, &http.Cookie{Name: m.config.CookieName, Value: id, Path: "/", Expires: now.Add(m.config.TTL), MaxAge: int(m.config.TTL.Seconds()), Secure: m.config.Secure, HttpOnly: true, SameSite: m.config.SameSite})
 }
 
 type memorySessionStore struct {
@@ -113,7 +117,9 @@ type Service struct {
 
 func NewService(users interface {
 	UserByUsername(context.Context, string) (db.User, error)
-}) *Service { return &Service{users: users} }
+}) *Service {
+	return &Service{users: users}
+}
 func (s *Service) Authenticate(ctx context.Context, username, password string) (db.User, error) {
 	u, err := s.users.UserByUsername(ctx, username)
 	if err != nil || u.Disabled || !VerifyPassword(u.PasswordHash, password) {
