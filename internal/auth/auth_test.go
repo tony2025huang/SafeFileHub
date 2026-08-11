@@ -260,6 +260,7 @@ func TestSessionManagerCloseCancelsBlockedGCAndPreventsRestart(t *testing.T) {
 		t.Fatal("GC did not enter DeleteExpired")
 	}
 	manager.Close()
+	manager.Close() // Close is safe to call repeatedly during layered shutdown.
 	select {
 	case <-store.exited:
 	case <-time.After(time.Second):
