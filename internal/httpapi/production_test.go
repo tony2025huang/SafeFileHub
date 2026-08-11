@@ -80,3 +80,54 @@ func TestNewProductionServerRouteContract(t *testing.T) {
 		}
 	}
 }
+
+func TestNewProductionServerInitialAdminAccessesSiteSettingsWithDefaultConfig(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.StorageRoot = filepath.Join(dir, "data")
+	cfg.SQLitePath = filepath.Join(dir, "safefilehub.db")
+	if err := os.MkdirAll(cfg.StorageRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := db.Open(ctx, cfg.SQLitePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	initial, err := repo.CreateUser(ctx, db.User{Username: "sfh-random-bootstrap-name", PasswordHash: "hash"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initial.ID != 1 {
+		t.Fatalf("initial user ID = %d, want 1", initial.ID)
+	}
+	store, err := storage.NewObjectStore(cfg.StorageRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	manager, err := archive.New(archive.Options{Workers: 1, MaxFiles: 10, MaxBytes: 1 << 20, TTL: time.Minute, TempDir: filepath.Join(dir, "archives")}, ObjectArchiveSource{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	limiter, err := limits.NewUploadLimiter(1, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions := auth.NewSessionManager(auth.NewMemorySessionStore(), auth.SessionConfig{InsecureCookie: true})
+	defer sessions.Close()
+	h, err := NewProductionServer(cfg, auth.NewService(repo), sessions, repo, permission.NewAuthorizer(repo, cfg.NamePolicy), store, manager, ProductionReadiness{DB: repo, ObjectStore: store, StoragePath: cfg.StorageRoot}, metrics.New(), limiter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/admin/site-settings", nil)
+	req.AddCookie(adminSession(t, sessions, initial.ID))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("initial admin site settings with default config = %d: %s", w.Code, w.Body.String())
+	}
+}

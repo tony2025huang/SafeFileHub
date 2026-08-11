@@ -25,6 +25,11 @@ func TestAdminUserAndPermissionManagement(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer repo.Close()
+	// Reserve ID 1 for the durable initial-admin identity. The configured
+	// username below must still authorize a separate, non-initial admin.
+	if _, err := repo.CreateUser(ctx, db.User{Username: "initial", PasswordHash: "initial-hash"}); err != nil {
+		t.Fatal(err)
+	}
 	adminHash, err := auth.HashPassword("admin-password")
 	if err != nil {
 		t.Fatal(err)
@@ -99,6 +104,35 @@ func TestAdminUserAndPermissionManagement(t *testing.T) {
 	}
 }
 
+func TestInitialAdminIDAuthorizesWithoutConfiguredUsername(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo, err := db.Open(ctx, filepath.Join(t.TempDir(), "admin.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	initial, err := repo.CreateUser(ctx, db.User{Username: "sfh-random-bootstrap-name", PasswordHash: "hash"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initial.ID != 1 {
+		t.Fatalf("initial user ID = %d, want 1", initial.ID)
+	}
+	cfg := config.Default() // Production defaults deliberately do not need a plaintext username.
+	sessions := auth.NewSessionManager(auth.NewMemorySessionStore(), auth.SessionConfig{InsecureCookie: true})
+	defer sessions.Close()
+	h, err := NewServerWithAdmin(cfg, auth.NewService(repo), sessions, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := adminJSON(t, h, adminSession(t, sessions, initial.ID), http.MethodPost, "/api/admin/users", `{"username":"member","password":"password"}`)
+	if r.Code != http.StatusCreated {
+		t.Fatalf("initial admin with default config = %d: %s", r.Code, r.Body.String())
+	}
+}
+
 func TestAdminEndpointsRejectNonAdmins(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -108,6 +142,9 @@ func TestAdminEndpointsRejectNonAdmins(t *testing.T) {
 	}
 	defer repo.Close()
 	hash, _ := auth.HashPassword("password")
+	if _, err := repo.CreateUser(ctx, db.User{Username: "initial", PasswordHash: hash}); err != nil {
+		t.Fatal(err)
+	}
 	user, err := repo.CreateUser(ctx, db.User{Username: "member", PasswordHash: hash})
 	if err != nil {
 		t.Fatal(err)

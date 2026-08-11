@@ -84,16 +84,24 @@ func requireAdmin(cfg config.Config, repo adminRepository, next http.Handler) ht
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id, _ := r.Context().Value(sessionUserIDKey{}).(int64)
 		u, err := repo.UserByID(r.Context(), id)
-		if err != nil || !isAdmin(cfg.AdminUsernames, u.Username) {
+		if err != nil || !isAdmin(cfg.AdminUsernames, u) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
-func isAdmin(names []string, username string) bool {
+
+// isAdmin recognizes user ID 1 as the durable initial administrator. Bootstrap
+// and reset both create or replace that exact record, so this authorization
+// does not depend on logging a generated username into production config. The
+// configured usernames remain supported for explicitly provisioned admins.
+func isAdmin(names []string, user db.User) bool {
+	if user.ID == 1 {
+		return true
+	}
 	for _, name := range names {
-		if name == username {
+		if name == user.Username {
 			return true
 		}
 	}

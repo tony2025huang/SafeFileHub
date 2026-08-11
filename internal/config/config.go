@@ -41,8 +41,9 @@ type Config struct {
 	// handler or socket timeout.
 	RequestIdleTimeout time.Duration
 	NamePolicy         NamePolicy
-	// AdminUsernames identifies the small bootstrap set permitted to manage
-	// users and scoped permissions. Authentication remains session-based.
+	// AdminUsernames identifies additional users permitted to manage users and
+	// scoped permissions. User ID 1 is always the durable initial administrator;
+	// authentication remains session-based.
 	AdminUsernames []string
 	// TrustedProxyCIDRs authorizes direct reverse-proxy peers to supply client IP headers.
 	TrustedProxyCIDRs []string

@@ -178,6 +178,9 @@ func TestSiteSettingsAdminAndUploadValidation(t *testing.T) {
 	}
 	defer repo.Close()
 	hash, _ := auth.HashPassword("password")
+	if _, err := repo.CreateUser(ctx, db.User{Username: "initial", PasswordHash: hash}); err != nil {
+		t.Fatal(err)
+	}
 	member, _ := repo.CreateUser(ctx, db.User{Username: "member", PasswordHash: hash})
 	assets, _ := siteassets.New(t.TempDir(), siteassets.Limits{MaxBytes: 32, MaxPixels: 100})
 	cfg := config.Default()
