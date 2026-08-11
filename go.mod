@@ -3,6 +3,7 @@ module github.com/example/safefilehub
 go 1.23
 
 require (
+	golang.org/x/crypto v0.28.0
 	golang.org/x/text v0.21.0
 	modernc.org/sqlite v1.34.5
 )
