@@ -308,8 +308,9 @@ export function filesAPI(fetchImpl = fetch) {
     async renameFile(fileID, path) { await checked(await fetchImpl(`/api/files/${encodeURIComponent(fileID)}`, { method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path: encodeLogicalPath(mutationPath(path))}), credentials:'same-origin' })); },
     async deleteFile(fileID) { await checked(await fetchImpl(`/api/files/${encodeURIComponent(fileID)}`, { method: 'DELETE', credentials: 'same-origin' })); },
     async deleteDirectory(directoryID) { await checked(await fetchImpl(`/api/directories/${encodeURIComponent(directoryID)}`, { method: 'DELETE', credentials: 'same-origin' })); },
-    async archive(rootID, path) {
-      const response = await checked(await fetchImpl(`/api/roots/${rootID}/archives`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path: encodeLogicalPath(path)}), credentials:'same-origin' }));
+    async archive(rootID, path, fileIDs = []) {
+      const body = fileIDs.length ? { file_ids: fileIDs } : { path: encodeLogicalPath(path) };
+      const response = await checked(await fetchImpl(`/api/roots/${rootID}/archives`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body), credentials:'same-origin' }));
       return response.json();
     },
     downloadURL(fileID) { return `/api/files/${encodeURIComponent(fileID)}`; },
@@ -409,6 +410,7 @@ function mountUI() {
   const fileSearch = document.querySelector('#file-search');
   const breadcrumb = document.querySelector('#breadcrumb');
   const fileActions = document.querySelector('#file-actions');
+  const selectionActions = document.querySelector('#selection-actions');
   if (!form || !input || !directories || !list || !result) return;
   const session = createSessionGuard();
   // Begin validation before wiring protected UI actions. API calls remain
@@ -474,6 +476,7 @@ function mountUI() {
       files.sort((a,b) => Number(Boolean(b.is_directory)) - Number(Boolean(a.is_directory)) || a.name.localeCompare(b.name));
       fileList.replaceChildren(...files.map(file => {
         const row = document.createElement('li'); row.className = 'file-row';
+        const select = document.createElement('input'); select.type = 'checkbox'; select.className = 'file-select'; select.dataset.fileId = String(file.id || ''); select.setAttribute('aria-label', `选择 ${file.name || file.path}`);
         const name = document.createElement(file.is_directory ? 'button' : 'strong'); name.textContent = `${file.is_directory ? '📁' : '📄'} ${file.name || file.path}`;
         if (file.is_directory) { name.className = 'link-button'; name.onclick = () => { directory.value = file.path; void renderFiles(); }; }
         const meta = document.createElement('span'); meta.className = 'file-meta';
@@ -482,7 +485,7 @@ function mountUI() {
         if (!file.is_directory && file.id) { const download = document.createElement('a'); download.href = fileAPI.downloadURL(file.id); download.textContent = '下载'; download.className = 'button secondary'; download.setAttribute('download',''); actions.append(download); }
         if (!file.is_directory && file.id) { const rename = document.createElement('button'); rename.type='button'; rename.textContent='重命名'; rename.onclick=async()=>{ const name=prompt('新文件名（仅支持文件）',file.name || ''); if(!name?.trim())return; try { await fileAPI.renameFile(file.id,joinPath(directory.value||'/',name.trim())); filesStatus.textContent='文件已重命名。'; await renderFiles(); } catch(error) { filesStatus.textContent=friendlyError(error); } }; actions.append(rename); }
         if (file.id) { const remove = document.createElement('button'); remove.type='button'; remove.textContent='删除'; remove.className='danger'; remove.onclick = async () => { if (!confirm(`确认删除“${file.name || file.path}”？此操作不可撤销。`)) return; remove.disabled=true; try { if (file.is_directory) await fileAPI.deleteDirectory(file.id); else await fileAPI.deleteFile(file.id); filesStatus.textContent='操作成功。'; await renderFiles(); } catch(error) { remove.disabled=false; filesStatus.textContent=friendlyError(error); } }; actions.append(remove); }
-        row.append(name, meta, actions); return row;
+        row.append(select, name, meta, actions); return row;
       }));
       filesStatus.textContent = files.length ? `${files.length} 项` : (query ? '没有匹配的文件。' : '当前目录为空。');
       const uploadTarget = document.querySelector('#upload-target');
@@ -496,7 +499,17 @@ function mountUI() {
   if (uploadFile) uploadFile.addEventListener('click', () => { selectedInput = input; input.click(); });
   if (uploadDir) uploadDir.addEventListener('click', () => { selectedInput = directories; directories.click(); });
   if (fileSearch) fileSearch.addEventListener('input', () => { void renderFiles(); });
-  if (fileActions) fileActions.addEventListener('click', async event => { const button = event.target.closest('button[data-action]'); if (!button || !['mkdir', 'text', 'archive'].includes(button.dataset.action)) return; if (button.dataset.action === 'archive') { try { const job=await fileAPI.archive(Number(root.value), directory.value || '/'); filesStatus.textContent=`归档任务已创建：${job.id || '处理中'}`; } catch(error) { filesStatus.textContent=friendlyError(error); } return; }
+  if (selectionActions) selectionActions.addEventListener('click', async event => {
+    const action = event.target.closest('button')?.dataset.action;
+    const boxes = [...document.querySelectorAll('#file-list .file-select')];
+    if (action === 'select-all' || action === 'invert' || action === 'clear') boxes.forEach(box => { box.checked = action === 'select-all' ? true : action === 'clear' ? false : !box.checked; });
+    if (action === 'archive-selected') {
+      const ids = boxes.filter(box => box.checked && box.dataset.fileId).map(box => Number(box.dataset.fileId));
+      if (!ids.length) { filesStatus.textContent = '请先选择文件。'; return; }
+      try { const job = await fileAPI.archive(Number(root.value), directory.value || '/', ids); filesStatus.textContent = `归档任务已创建：${job.id || '处理中'}`; } catch (error) { filesStatus.textContent = friendlyError(error); }
+    }
+  });
+  if (fileActions) fileActions.addEventListener('click', async event => { const button = event.target.closest('button[data-action]'); if (!button || !['mkdir', 'text'].includes(button.dataset.action)) return;
     const name = prompt(button.dataset.action === 'mkdir' ? '新建目录名称' : '新建文本名称'); if (!name?.trim()) return;
     const path = joinPath(directory.value || '/', name.trim());
     try { if (button.dataset.action === 'text') { const content = prompt('文本内容（UTF-8，最大 16 MiB）', ''); if (content === null) return; await fileAPI.createFile(Number(root.value), path, content); filesStatus.textContent = '文本文件已创建并写入内容。'; } else { await fileAPI.createDirectory(Number(root.value), path); filesStatus.textContent = '目录已创建。'; } await renderFiles(); } catch (error) { filesStatus.textContent = friendlyError(error); }

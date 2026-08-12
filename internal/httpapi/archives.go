@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -82,13 +83,17 @@ func createArchive(repo archiveRepository, auth archiveAuthorizer, manager *arch
 		}
 		var in struct {
 			Path string `json:"path"`
+			FileIDs []int64 `json:"file_ids"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&in); err != nil {
 			http.Error(w, "invalid archive request", 400)
 			return
 		}
-		decodedPath := strings.TrimPrefix(in.Path, "/")
-		if in.Path == "/" {
+		if in.Path == "" { in.Path = "/" }
+		decodedWirePath, err := url.PathUnescape(in.Path)
+		if err != nil { http.Error(w, "invalid archive path", 400); return }
+		decodedPath := strings.TrimPrefix(decodedWirePath, "/")
+		if decodedWirePath == "/" {
 			decodedPath = "/"
 		}
 		p, err := pathpolicy.ParseDecodedPath(decodedPath, policy)
@@ -112,7 +117,12 @@ func createArchive(repo archiveRepository, auth archiveAuthorizer, manager *arch
 		}
 		entries := make([]archive.Entry, 0)
 		for _, f := range files {
-			if f.LogicalPath == p.Canonical || strings.HasPrefix(f.LogicalPath, strings.TrimSuffix(p.Canonical, "/")+"/") {
+			selected := len(in.FileIDs) == 0 && (f.LogicalPath == p.Canonical || strings.HasPrefix(f.LogicalPath, strings.TrimSuffix(p.Canonical, "/")+"/"))
+			if len(in.FileIDs) > 0 {
+				for _, id := range in.FileIDs { if id == f.ID { selected = true; break } }
+			}
+			if selected {
+				if len(in.FileIDs) > 0 && f.RootID != rootID { continue }
 				entries = append(entries, archive.Entry{LogicalPath: f.LogicalPath, ObjectKey: f.ObjectKey, Size: f.Size})
 			}
 		}
