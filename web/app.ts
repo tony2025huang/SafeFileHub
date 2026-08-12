@@ -270,7 +270,9 @@ function mountUI() {
       const title = document.createElement('strong'); title.textContent = item.path;
       const progress = document.createElement('progress'); progress.className = 'progress'; progress.max = 1; progress.value = item.progress;
       const state = document.createElement('span'); state.className = 'badge'; state.textContent = ({ queued: '排队中', uploading: '上传中', paused: '已暂停', completed: '已完成', failed: '失败', cancelled: '已取消' })[item.status] || item.status;
-      info.append(title, progress, state); row.append(info);
+      info.append(title, progress, state);
+      if (item.error) { const error = document.createElement('span'); error.className = 'error'; error.textContent = item.error; info.append(error); }
+      row.append(info);
       for (const [label, action] of [['暂停', () => batch.pause(item)], ['取消', () => batch.cancel(item)], ['重试', () => batch.retry(item)]]) {
         const button = document.createElement('button'); button.type = 'button'; button.textContent = label;
         button.onclick = async () => { await action(); render(); }; row.append(' ', button);
@@ -333,7 +335,7 @@ function mountUI() {
       });
       await refreshBranding();
       showAdminStatus('Settings saved.');
-    } catch (error) { showAdminStatus(error.message); }
+    } catch (error) { showAdminStatus(friendlyError(error)); }
   });
   for (const upload of admin.querySelectorAll('[data-asset-upload]')) upload.addEventListener('change', async event => {
     const file = event.target.files?.[0];
@@ -343,14 +345,14 @@ function mountUI() {
       await refreshBranding();
       showAdminStatus('Logo uploaded.');
       event.target.value = '';
-    } catch (error) { showAdminStatus(error.message); }
+    } catch (error) { showAdminStatus(friendlyError(error)); }
   });
   for (const reset of admin.querySelectorAll('[data-asset-reset]')) reset.addEventListener('click', async () => {
     try {
       await api.resetAsset(reset.dataset.assetReset);
       await refreshBranding();
       showAdminStatus('Logo reset.');
-    } catch (error) { showAdminStatus(error.message); }
+    } catch (error) { showAdminStatus(friendlyError(error)); }
   });
 }
 

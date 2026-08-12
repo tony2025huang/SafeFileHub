@@ -18,6 +18,14 @@ test('friendly errors never expose internal server details', () => {
   assert.equal(friendlyError(Object.assign(new Error('secret stack'), { status: 403 })), '你没有执行此操作的权限。');
   assert.equal(friendlyError(Object.assign(new Error('secret'), { status: 500 })), '服务暂时不可用，请稍后再试。');
   assert.equal(friendlyError(Object.assign(new Error('secret'), { status: 429 })), '操作太频繁，请稍后再试。');
+  assert.equal(friendlyError(new TypeError('https://internal.example/config')), '网络连接失败，请检查网络后重试。');
+});
+
+test('UI renders safe failure states instead of raw exception messages', async () => {
+  const source = await readFile(new URL('./app.ts', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /showAdminStatus\(error\.message\)/);
+  assert.match(source, /item\.error/);
+  assert.match(source, /服务暂时不可用，请稍后再试/);
 });
 
 test('deployment HTML loads the browser-ready JavaScript entrypoint', async () => {

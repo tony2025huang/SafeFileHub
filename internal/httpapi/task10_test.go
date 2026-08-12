@@ -10,7 +10,14 @@ import (
 )
 
 func TestServerServesEmbeddedTransferUI(t *testing.T) {
-	h, err := NewServer(config.Default())
+	cfg := config.Default()
+	// Check concrete values that must never be serialized into public assets,
+	// rather than rejecting generic words such as "data" that are valid UI text.
+	cfg.StorageRoot = "/srv/safefilehub-sensitive-storage-canary"
+	cfg.SQLitePath = "/etc/safefilehub-sensitive.sqlite-canary"
+	cfg.ListenAddr = "127.0.0.1:49173"
+	cfg.LogPath = "/var/log/safefilehub-sensitive.log-canary"
+	h, err := NewServer(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,8 +38,10 @@ func TestServerServesEmbeddedTransferUI(t *testing.T) {
 		if !strings.Contains(r.Body.String(), want.body) {
 			t.Errorf("GET %s did not serve expected asset", want.path)
 		}
-		if strings.Contains(r.Body.String(), config.Default().StorageRoot) {
-			t.Errorf("GET %s leaked storage root", want.path)
+		for _, secret := range []string{cfg.StorageRoot, cfg.SQLitePath, cfg.ListenAddr, cfg.LogPath} {
+			if secret != "" && strings.Contains(r.Body.String(), secret) {
+				t.Errorf("GET %s leaked configured value %q", want.path, secret)
+			}
 		}
 	}
 }
