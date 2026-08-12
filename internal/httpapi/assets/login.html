@@ -3,22 +3,42 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
   <title>SafeFileHub login</title>
+  <style>
+    :root { color-scheme: light dark; --bg: #eef3f8; --card: #fff; --ink: #172033; --muted: #637083; --accent: #2563eb; --accent-strong: #1d4ed8; --border: #d7dee8; --error: #b42318; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #101827; --card: #182235; --ink: #f1f5fb; --muted: #aab6c8; --border: #334155; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 1.5rem; background: radial-gradient(circle at top, color-mix(in srgb, var(--accent) 13%, transparent), transparent 40%), var(--bg); color: var(--ink); font: 16px/1.5 system-ui, -apple-system, sans-serif; }
+    main { width: min(100%, 27rem); padding: clamp(1.5rem, 5vw, 2.5rem); background: var(--card); border: 1px solid var(--border); border-radius: 1.25rem; box-shadow: 0 1rem 3rem #0f172a1c; }
+    .brand { min-height: 2.5rem; display: grid; place-items: center; margin-bottom: 1.25rem; }
+    #login-logo { max-width: 12rem; max-height: 3.5rem; object-fit: contain; }
+    h1 { margin: 0 0 1.5rem; text-align: center; font-size: clamp(1.5rem, 5vw, 1.85rem); letter-spacing: -.02em; }
+    form { display: grid; gap: 1rem; }
+    label { display: grid; gap: .4rem; color: var(--muted); font-size: .9rem; font-weight: 600; }
+    input { width: 100%; padding: .75rem .85rem; border: 1px solid var(--border); border-radius: .65rem; background: transparent; color: var(--ink); font: inherit; }
+    input:focus { outline: 3px solid color-mix(in srgb, var(--accent) 28%, transparent); border-color: var(--accent); }
+    button { margin-top: .25rem; padding: .78rem 1rem; border: 0; border-radius: .65rem; background: var(--accent); color: white; font: inherit; font-weight: 700; cursor: pointer; }
+    button:hover { background: var(--accent-strong); } button:disabled { cursor: wait; opacity: .7; }
+    #status { min-height: 1.5em; margin: 1rem 0 0; color: var(--muted); text-align: center; }
+    #status.error { color: var(--error); }
+  </style>
 </head>
 <body>
   <main>
+    <div class="brand"><img id="login-logo" hidden alt=""></div>
     <h1 id="site-name">SafeFileHub</h1>
-    <img id="login-logo" hidden alt="">
     <form id="login-form">
-      <label>Username <input name="username" autocomplete="username" required></label>
+      <label>Username <input name="username" autocomplete="username" required autofocus></label>
       <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
       <button type="submit">Sign in</button>
     </form>
-    <p id="status" aria-live="polite"></p>
+    <p id="status" role="status" aria-live="polite"></p>
   </main>
   <script>
     // Keep the login bootstrap self-contained: a failed session must not make
     // the page depend on the authenticated transfer application bundle.
+    const form = document.querySelector('#login-form');
     const status = document.querySelector('#status');
     const name = document.querySelector('#site-name');
     const logo = document.querySelector('#login-logo');
@@ -29,19 +49,26 @@
         document.title = `${name.textContent} login`;
         if (settings.login_logo_url) { logo.src = settings.login_logo_url; logo.hidden = false; }
       }).catch(() => {});
-    document.querySelector('#login-form').addEventListener('submit', async event => {
+    form.addEventListener('submit', async event => {
       event.preventDefault();
       const fields = event.currentTarget.elements;
+      const button = form.querySelector('button');
+      status.className = '';
       status.textContent = 'Signing in…';
+      button.disabled = true;
       try {
         const response = await fetch('/login', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           credentials: 'same-origin',
           body: JSON.stringify({ username: fields.username.value, password: fields.password.value }),
         });
-        if (!response.ok) throw new Error('invalid credentials');
+        if (!response.ok) throw new Error('Invalid username or password.');
         location.assign('/');
-      } catch (error) { status.textContent = error.message; }
+      } catch (error) {
+        status.className = 'error';
+        status.textContent = error.message;
+        button.disabled = false;
+      }
     });
   </script>
 </body>

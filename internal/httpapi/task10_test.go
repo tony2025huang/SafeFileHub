@@ -48,6 +48,15 @@ func TestServerLoginPageIsSelfContainedAndPublic(t *testing.T) {
 		if r.Code != http.StatusOK || strings.Contains(r.Body.String(), `src="./app.js"`) {
 			t.Fatalf("login page is not a public self-contained page: status=%d body=%q", r.Code, r.Body.String())
 		}
+		body := r.Body.String()
+		for _, want := range []string{"SafeFileHub login", "name=\"username\"", "autocomplete=\"current-password\"", "aria-live=\"polite\"", "fetch('/login'"} {
+			if !strings.Contains(body, want) {
+				t.Errorf("login page missing %q", want)
+			}
+		}
+		if strings.Contains(body, "src=\"/app.js\"") || strings.Contains(body, "src=\"./app.js\"") {
+			t.Errorf("login page must not load protected app.js")
+		}
 	}
 }
 

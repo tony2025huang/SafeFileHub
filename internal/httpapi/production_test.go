@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -68,6 +69,14 @@ func TestNewProductionServerRouteContract(t *testing.T) {
 		if w.Code == http.StatusNotFound || w.Code == http.StatusMethodNotAllowed {
 			t.Errorf("%s %s is not registered: %d", route.method, route.path, w.Code)
 		}
+	}
+	loginPage := httptest.NewRecorder()
+	h.ServeHTTP(loginPage, httptest.NewRequest(http.MethodGet, "/login", nil))
+	if loginPage.Code != http.StatusOK || loginPage.Header().Get("Content-Type") != "text/html; charset=utf-8" {
+		t.Fatalf("public production login page = %d %q", loginPage.Code, loginPage.Header().Get("Content-Type"))
+	}
+	if body := loginPage.Body.String(); body == "" || strings.Contains(body, `src="./app.js"`) || strings.Contains(body, `src="/app.js"`) {
+		t.Fatalf("production login page is not self-contained: %q", body)
 	}
 	// These routes legitimately return 404 when no branding asset is configured;
 	// a method mismatch proves their GET-only public contracts are installed.
