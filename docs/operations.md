@@ -15,6 +15,50 @@ proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 
 并以 `--trusted-proxy-cidr=127.0.0.1/32`、`--trusted-proxy-cidr=::1/128` 或实际代理网段启动服务。
 
+## systemd + Nginx 部署
+
+推荐使用 `deploy/safefilehub.service.example` 作为 systemd unit 模板：先创建并锁定
+`/var/lib/safefilehub/data` 和 `/var/log/safefilehub` 的 ownership/mode，按实际二进制、
+用户、组、工作目录和 trusted proxy 网段调整 unit，再执行：
+
+```sh
+systemctl daemon-reload
+systemctl enable --now safefilehub
+systemctl status safefilehub
+```
+
+SafeFileHub 的默认监听地址是 `:8080`。让 systemd 服务只绑定 loopback 或私网地址，
+由 Nginx 负责公网 TLS 和反向代理；后端可使用：
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_http_version 1.1;
+    proxy_request_buffering off;
+    proxy_read_timeout 30m;
+    proxy_send_timeout 30m;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+}
+```
+
+临时公网验证时，不要假定或固化一个“验证端口”：公网端口由部署环境的端口映射、
+防火墙或负载均衡配置提供，并应仅在验证窗口内开放。验证完成后撤销该配置，恢复仅
+通过正式 TLS 入口访问。
+
+## 路由与登录页
+
+无需登录的公开入口是 `GET /`、`GET /index.html`、`GET /login`、`GET /login.html`、
+`GET /app.js`、`GET /healthz`、`GET /readyz`、`GET /metrics`、`GET /api/site-settings`、
+`GET /assets/site/{assetID}` 和 `GET /favicon.ico`。品牌资源不存在时，后两者可返回
+`404`，这不代表路由未安装。登录页为内嵌自包含 HTML，客户端通过 `POST /login` 建立
+session；`POST /logout`、`GET /session` 以及文件、上传、归档、管理员 API 需要按接口
+要求认证。反向代理应同时放行 GET/POST/PATCH/HEAD/DELETE，并关闭 request buffering，
+以支持可恢复上传。
+
 ## 持久化存储与备份
 
 `data/` 是一个恢复单元：含 SQLite 元数据、完成 objects、`staging` 和 archive artifacts。必须使用本地、持久、可写并支持文件锁的 filesystem；生产环境不得使用 `tmpfs`。`staging` 必须和完成对象在同一 filesystem，完成上传依赖 atomic rename。SQLite 尝试启用 WAL，因此 WAL/SHM 文件也需要稳定目录和正确权限。
@@ -33,6 +77,12 @@ SQLite 数据库与完成对象必须一起备份，使用 SQLite 支持的备�
 空数据库第一次启动自动生成随机 `sfh-*` 管理员用户名和高强度密码，并只输出一次。普通重启不会轮换；数据库只保存 Argon2id hash。初始凭据会出现在进程初始化日志中，必须在首次启动前保护日志文件和 journal 访问权限。
 
 `--reset-initial-admin` 是 break-glass 操作：它仅重置 `users.id=1`、启用该账号、打印新的随机凭据，然后退出，绝不会启动 HTTP；id 1 不存在时失败。
+
+bootstrap 和 reset 输出的用户名/密码属于高敏感凭据材料：进程 stderr、systemd
+journal、容器日志、日志聚合器、终端录屏和备份都可能留存它们。首次启动或 reset 前
+必须先限制 journal/日志文件访问，仅通过受控渠道读取一次并立即按组织流程清理或过期
+处理相关日志。不要把任何真实用户名、密码、token、cookie 或远端主机凭据写入 unit、
+镜像、shell history、工单、示例配置或版本库；本文档和示例只描述流程，不提供真实凭据。
 
 应用事件总是写 stderr。设置 `--log-path=/var/log/safefilehub/app.json` 后，同一事件也写文件；服务创建该文件为 `0600`。推荐：
 
@@ -89,6 +139,7 @@ limit 范围为 `1..64`。不要用宽泛 shell 删除 staging。upload recovery
 发布前：
 
 ```sh
+GOTOOLCHAIN=local /usr/local/go/bin/go version  # 应为 go1.24.x
 GOTOOLCHAIN=local /usr/local/go/bin/go test ./... -race -count=1
 GOTOOLCHAIN=local /usr/local/go/bin/go vet ./...
 GOTOOLCHAIN=local /usr/local/go/bin/go test ./... -cover

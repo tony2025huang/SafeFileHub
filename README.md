@@ -22,6 +22,8 @@ SafeFileHub 是面向内部或受控环境的 Go 安全文件服务，提供认�
 - `DELETE /api/uploads/{id}`：**只取消未完成**的 upload session，不删除已发布文件。
 - `POST /api/roots/{rootID}/archives`、`GET|DELETE /api/archives/{jobID}`，以及 `/api/admin/*`。
 
+公开路由（无需登录即可访问）包括 `GET /`、`GET /index.html`、`GET /login`、`GET /login.html`、`GET /app.js`、`GET /healthz`、`GET /readyz`、`GET /metrics`、`GET /api/site-settings`、`GET /assets/site/{assetID}` 和 `GET /favicon.ico`（没有对应品牌资源时可能返回 `404`）。登录页是内嵌的自包含页面；`POST /login` 用于建立 session。文件、上传、归档和管理 API 仍需认证与相应权限。
+
 创建和删除均需对应逻辑路径的权限；路径校验拒绝 traversal、double encoding、反斜杠、NUL/control character、Windows 保留名、危险前缀和符号链接逃逸。具体字段和响应以 `internal/httpapi` 的实现与测试为准。
 
 ## 初始管理员
@@ -88,7 +90,7 @@ bind mount（或一个覆盖整个 data 目录、支持 SQLite 文件锁的 name
 
 ## systemd 与反向代理
 
-使用 `deploy/safefilehub.service.example`：复制后按实际二进制、用户、组和目录调整，再执行 `systemctl daemon-reload`、`systemctl enable --now safefilehub`。示例中的日志路径和 `ReadWritePaths` 是配套的；详见 `docs/operations.md`。
+使用 `deploy/safefilehub.service.example`：复制后按实际二进制、用户、组和目录调整，再执行 `systemctl daemon-reload`、`systemctl enable --now safefilehub`。示例中的日志路径和 `ReadWritePaths` 是配套的；详见 `docs/operations.md`。默认后端监听地址是 `:8080`，生产环境通常让 systemd 服务仅监听 loopback/私网，再由 Nginx 终止 TLS 并反向代理到 `http://127.0.0.1:8080`。若需要临时公网验证，公网暴露端口必须由部署环境的端口映射、防火墙或负载均衡配置决定，不应把某个临时端口写死在应用或文档中；验证结束后应立即撤销暴露。
 
 将服务绑定在 loopback 或私网地址，TLS 在 Nginx/Caddy/Envoy 或托管负载均衡器终止。只有 direct peer IP 属于某个 `--trusted-proxy-cidr` 时，服务才解析 `X-Forwarded-For`：从右向左跳过可信代理，采用最接近可信代理的第一个非可信 IP；若没有该值才使用有效 `X-Real-IP`，否则使用 direct peer。未受信任 direct peer 提供的转发头一律忽略。
 
@@ -111,7 +113,10 @@ location / {
 
 ## 开发检查
 
+本地门禁使用 Go 1.24 工具链（不要让命令隐式下载或切换工具链）：
+
 ```sh
+GOTOOLCHAIN=local /usr/local/go/bin/go version  # 应为 go1.24.x
 GOTOOLCHAIN=local /usr/local/go/bin/go test ./... -race -count=1
 GOTOOLCHAIN=local /usr/local/go/bin/go vet ./...
 GOTOOLCHAIN=local /usr/local/go/bin/go test ./... -cover
