@@ -4,6 +4,17 @@
 
 export const DEFAULT_PER_FILE_CONCURRENCY = 4;
 
+export function friendlyError(error) {
+  const status = Number(error?.status || 0);
+  if (status === 401) { if (typeof location !== 'undefined') location.assign('/login'); return '登录已过期，请重新登录。'; }
+  if (status === 403) return '你没有执行此操作的权限。';
+  if (status === 409) return '文件状态已变化，请刷新后重试。';
+  if (status === 429) return '操作太频繁，请稍后再试。';
+  if (status >= 500) return '服务暂时不可用，请稍后再试。';
+  if (error?.name === 'TypeError' || error?.name === 'AbortError') return '网络连接失败，请检查网络后重试。';
+  return '操作失败，请稍后再试。';
+}
+
 function joinPath(directory, relative) {
   const base = directory === '/' ? '' : directory.replace(/\/+$/, '');
   const pieces = relative.replace(/^\/+/, '').split('/').filter(Boolean);
@@ -72,7 +83,7 @@ export function createUploadBatch(files, api, options) {
     } catch (error) {
       item.controller = null;
       if (item.status === 'paused' || item.status === 'cancelled') return;
-      item.error = error instanceof Error ? error.message : String(error);
+      item.error = friendlyError(error);
       setStatus(item, 'failed');
     }
   }
@@ -137,7 +148,7 @@ export function createUploadBatch(files, api, options) {
 
 export function uploadAPI(fetchImpl = fetch) {
   async function checked(response) {
-    if (!response.ok) throw new Error(`upload request failed (${response.status})`);
+    if (!response.ok) { const error = new Error('request failed'); error.status = response.status; throw error; }
     return response;
   }
   return {
@@ -169,7 +180,7 @@ export function filesAPI(fetchImpl = fetch) {
     async list(rootID, path = '/') {
       if (!Number.isInteger(rootID) || rootID <= 0) throw new Error('a positive rootID is required');
       const response = await fetchImpl(`/roots/${rootID}/files?path=${encodeLogicalPath(path)}`, { credentials: 'same-origin' });
-      if (!response.ok) throw new Error(`file list request failed (${response.status})`);
+      if (!response.ok) { const error = new Error('request failed'); error.status = response.status; throw error; }
       return response.json();
     },
   };
@@ -254,8 +265,13 @@ function mountUI() {
     const batch = createUploadBatch(input.files, uploadAPI(), { rootID: Number(root.value), directory: directory.value || '/' });
     const render = () => { list.replaceChildren(...batch.items.map(item => {
       const row = document.createElement('li');
-      row.textContent = `${item.path} — ${item.status} (${Math.round(item.progress * 100)}%)`;
-      for (const [label, action] of [['Pause', () => batch.pause(item)], ['Cancel', () => batch.cancel(item)], ['Retry', () => batch.retry(item)]]) {
+      row.className = 'upload-row';
+      const info = document.createElement('div'); info.className = 'upload-info';
+      const title = document.createElement('strong'); title.textContent = item.path;
+      const progress = document.createElement('progress'); progress.className = 'progress'; progress.max = 1; progress.value = item.progress;
+      const state = document.createElement('span'); state.className = 'badge'; state.textContent = ({ queued: '排队中', uploading: '上传中', paused: '已暂停', completed: '已完成', failed: '失败', cancelled: '已取消' })[item.status] || item.status;
+      info.append(title, progress, state); row.append(info);
+      for (const [label, action] of [['暂停', () => batch.pause(item)], ['取消', () => batch.cancel(item)], ['重试', () => batch.retry(item)]]) {
         const button = document.createElement('button'); button.type = 'button'; button.textContent = label;
         button.onclick = async () => { await action(); render(); }; row.append(' ', button);
       }
@@ -282,13 +298,15 @@ function mountUI() {
         return row;
       }));
       filesStatus.textContent = `${response.files.length} files`;
-    } catch (error) { filesStatus.textContent = error.message; }
+    } catch (error) { filesStatus.textContent = friendlyError(error); }
   };
   if (refreshFiles) refreshFiles.addEventListener('click', () => { void renderFiles(); });
   const admin = document.querySelector('#admin-settings');
   const adminForm = document.querySelector('#admin-settings-form');
   const adminStatus = document.querySelector('#admin-settings-status');
   const showAdminStatus = message => { if (adminStatus) adminStatus.textContent = message; };
+  const logout = document.querySelector('#logout');
+  if (logout) logout.addEventListener('click', async () => { logout.disabled = true; try { await fetch('/logout', { method: 'POST', credentials: 'same-origin' }); location.assign('/login'); } catch (error) { logout.disabled = false; showAdminStatus(friendlyError(error)); } });
   const refreshBranding = async () => {
     const settings = await api.publicSettings();
     applySiteSettings(settings);

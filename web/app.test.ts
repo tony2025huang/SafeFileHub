@@ -11,7 +11,14 @@ import {
   encodeLogicalPath,
   filesAPI,
   formatMD5,
+  friendlyError,
 } from './app.ts';
+
+test('friendly errors never expose internal server details', () => {
+  assert.equal(friendlyError(Object.assign(new Error('secret stack'), { status: 403 })), '你没有执行此操作的权限。');
+  assert.equal(friendlyError(Object.assign(new Error('secret'), { status: 500 })), '服务暂时不可用，请稍后再试。');
+  assert.equal(friendlyError(Object.assign(new Error('secret'), { status: 429 })), '操作太频繁，请稍后再试。');
+});
 
 test('deployment HTML loads the browser-ready JavaScript entrypoint', async () => {
   const [html, browserEntry, source] = await Promise.all([

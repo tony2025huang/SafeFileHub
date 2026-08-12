@@ -1,22 +1,17 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SafeFileHub transfers</title>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark">
+  <title>SafeFileHub 文件传输</title><link id="site-favicon" rel="icon" href="/favicon.ico">
+  <style>
+    :root{color-scheme:light dark;--primary-color:#2563eb;--primary-strong:#1d4ed8;--bg:#f4f7fb;--surface:#fff;--ink:#172033;--muted:#64748b;--border:#dbe3ee;--danger:#b42318;--success:#087443;font:16px/1.5 system-ui,-apple-system,sans-serif}
+    @media(prefers-color-scheme:dark){:root{--bg:#0f172a;--surface:#182235;--ink:#f1f5fb;--muted:#aab6c8;--border:#334155}}
+    *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top right,color-mix(in srgb,var(--primary-color) 14%,transparent),transparent 34%),var(--bg);color:var(--ink)}
+    .shell{width:min(100% - 2rem,72rem);margin:auto}.topbar{display:flex;align-items:center;justify-content:space-between;gap:1rem;padding:1.25rem 0}.brand{display:flex;align-items:center;gap:.7rem;font-size:1.2rem}.brand img{max-width:9rem;max-height:2.8rem;object-fit:contain}.userbar{display:flex;align-items:center;gap:.75rem;color:var(--muted);font-size:.9rem}main{display:grid;gap:1.25rem;padding:1rem 0 3rem}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,22rem),1fr));gap:1.25rem}.card{padding:clamp(1rem,3vw,1.5rem);background:color-mix(in srgb,var(--surface) 94%,transparent);border:1px solid var(--border);border-radius:1rem;box-shadow:0 .75rem 2rem #0f172a12}h1,h2{margin-top:0;letter-spacing:-.02em}h1{font-size:clamp(1.5rem,4vw,2.1rem)}h2{font-size:1.2rem}form{display:grid;gap:1rem}label{display:grid;gap:.35rem;color:var(--muted);font-size:.9rem;font-weight:600}input{width:100%;padding:.7rem .8rem;border:1px solid var(--border);border-radius:.6rem;background:transparent;color:var(--ink);font:inherit}input:focus{outline:3px solid color-mix(in srgb,var(--primary-color) 25%,transparent);border-color:var(--primary-color)}button{padding:.65rem .9rem;border:0;border-radius:.6rem;background:var(--primary-color);color:#fff;font:inherit;font-weight:700;cursor:pointer}button:hover{background:var(--primary-strong)}button.secondary{background:transparent;color:var(--primary-color);border:1px solid var(--primary-color)}button:disabled{opacity:.6;cursor:wait}.actions{display:flex;flex-wrap:wrap;gap:.5rem}.status{min-height:1.5em;color:var(--muted)}.alert{padding:.7rem .9rem;border-radius:.6rem;background:color-mix(in srgb,var(--danger) 12%,transparent);color:var(--danger)}.badge{display:inline-block;padding:.15rem .5rem;border-radius:999px;background:color-mix(in srgb,var(--primary-color) 14%,transparent);color:var(--primary-color);font-size:.8rem}.progress{width:100%;height:.5rem;accent-color:var(--primary-color)}ul{padding:0;margin:.75rem 0 0;list-style:none;display:grid;gap:.6rem}.upload-row,.file-row{display:flex;align-items:center;justify-content:space-between;gap:.75rem;padding:.7rem;border:1px solid var(--border);border-radius:.6rem}.upload-info{min-width:0;flex:1}.upload-info strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}footer{color:var(--muted);font-size:.85rem;padding:1rem 0}@media(max-width:600px){.topbar{align-items:flex-start;flex-direction:column}.userbar{width:100%;justify-content:space-between}.upload-row,.file-row{align-items:flex-start;flex-direction:column}}
+  </style>
 </head>
-<body>
-  <main>
-    <h1>Upload files or a directory</h1>
-    <form id="upload-form">
-      <label>Storage root ID <input id="root-id" type="number" min="1" required></label>
-      <label>Destination directory <input id="directory" value="/" required></label>
-      <label>Files <input id="files" type="file" multiple webkitdirectory></label>
-      <button type="submit">Start transfer</button>
-    </form>
-    <p id="summary" aria-live="polite"></p>
-    <ul id="uploads" aria-live="polite"></ul>
-  </main>
-  <script type="module" src="./app.js"></script>
-</body>
-</html>
+<body><div class="shell">
+  <header class="topbar"><div class="brand"><img id="nav-logo" hidden alt=""><img id="login-logo" hidden alt=""><strong data-site-name>SafeFileHub</strong></div><div class="userbar"><span id="user-status">已登录</span><button id="logout" class="secondary" type="button">退出登录</button></div></header>
+  <main><section class="card"><h1>安全传输文件</h1><p class="status">选择文件或目录，上传到指定存储位置。</p><form id="upload-form"><label>存储根 ID<input id="root-id" type="number" min="1" required></label><label>目标目录<input id="directory" value="/" required></label><label>文件<input id="files" type="file" multiple webkitdirectory></label><button type="submit">开始上传</button></form><p id="summary" class="status" aria-live="polite"></p><ul id="uploads" aria-live="polite"></ul></section>
+  <section class="card"><div class="actions"><h2 style="margin-right:auto;margin-bottom:0">文件列表</h2><button id="refresh-files" class="secondary" type="button">刷新</button></div><p id="files-status" class="status" aria-live="polite">请输入存储根 ID 后刷新</p><ul id="file-list" aria-live="polite"></ul></section>
+  <section id="admin-settings" class="card" hidden><h2>站点设置</h2><form id="admin-settings-form"><label>站点名称<input name="site_name" required maxlength="120"></label><label>品牌色<input name="primary_color" type="color" value="#2563eb" required></label><label><span><input name="filing_enabled" type="checkbox"> 显示备案文本</span></label><label>备案文本<input name="filing_text" maxlength="240"></label><label><span><input name="md5_enabled" type="checkbox"> 启用 MD5 显示</span></label><div class="actions"><label>登录 Logo<input data-asset-upload="login_logo" type="file" accept="image/*"></label><button data-asset-reset="login_logo" class="secondary" type="button">重置</button></div><div class="actions"><label>导航 Logo<input data-asset-upload="nav_logo" type="file" accept="image/*"></label><button data-asset-reset="nav_logo" class="secondary" type="button">重置</button></div><div class="actions"><label>图标<input data-asset-upload="favicon" type="file" accept="image/*"></label><button data-asset-reset="favicon" class="secondary" type="button">重置</button></div><button type="submit">保存设置</button></form><p id="admin-settings-status" class="status" aria-live="polite"></p></section></main><footer><span id="filing" hidden></span></footer></div><script type="module" src="./app.js"></script></body></html>

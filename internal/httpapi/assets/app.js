@@ -4,6 +4,17 @@
 
 export const DEFAULT_PER_FILE_CONCURRENCY = 4;
 
+export function friendlyError(error) {
+  const status = Number(error?.status || 0);
+  if (status === 401) { if (typeof location !== 'undefined') location.assign('/login'); return '登录已过期，请重新登录。'; }
+  if (status === 403) return '你没有执行此操作的权限。';
+  if (status === 409) return '文件状态已变化，请刷新后重试。';
+  if (status === 429) return '操作太频繁，请稍后再试。';
+  if (status >= 500) return '服务暂时不可用，请稍后再试。';
+  if (error?.name === 'TypeError' || error?.name === 'AbortError') return '网络连接失败，请检查网络后重试。';
+  return '操作失败，请稍后再试。';
+}
+
 function joinPath(directory, relative) {
   const base = directory === '/' ? '' : directory.replace(/\/+$/, '');
   const pieces = relative.replace(/^\/+/, '').split('/').filter(Boolean);
@@ -72,7 +83,7 @@ export function createUploadBatch(files, api, options) {
     } catch (error) {
       item.controller = null;
       if (item.status === 'paused' || item.status === 'cancelled') return;
-      item.error = error instanceof Error ? error.message : String(error);
+      item.error = friendlyError(error);
       setStatus(item, 'failed');
     }
   }
@@ -137,7 +148,7 @@ export function createUploadBatch(files, api, options) {
 
 export function uploadAPI(fetchImpl = fetch) {
   async function checked(response) {
-    if (!response.ok) throw new Error(`upload request failed (${response.status})`);
+    if (!response.ok) { const error = new Error('request failed'); error.status = response.status; throw error; }
     return response;
   }
   return {
@@ -164,6 +175,80 @@ export function uploadAPI(fetchImpl = fetch) {
   };
 }
 
+export function filesAPI(fetchImpl = fetch) {
+  return {
+    async list(rootID, path = '/') {
+      if (!Number.isInteger(rootID) || rootID <= 0) throw new Error('a positive rootID is required');
+      const response = await fetchImpl(`/roots/${rootID}/files?path=${encodeLogicalPath(path)}`, { credentials: 'same-origin' });
+      if (!response.ok) { const error = new Error('request failed'); error.status = response.status; throw error; }
+      return response.json();
+    },
+  };
+}
+
+export function formatMD5(file, enabled) {
+  if (!enabled || !file) return '';
+  if (file.md5_status === 'ready' && /^[a-f0-9]{32}$/.test(file.md5_digest || '')) return `MD5: ${file.md5_digest}`;
+  const labels = { pending: 'MD5: pending', computing: 'MD5: computing', failed: 'MD5: unavailable', disabled: 'MD5: disabled' };
+  return labels[file.md5_status] || 'MD5: unavailable';
+}
+
+export function siteSettingsAPI(fetchImpl = fetch) {
+  async function checked(response) {
+    if (!response.ok) throw new Error(`site settings request failed (${response.status})`);
+    return response;
+  }
+  return {
+    async publicSettings() {
+      return checked(await fetchImpl('/api/site-settings', { credentials: 'same-origin' })).then(response => response.json());
+    },
+    async adminSettings() {
+      return checked(await fetchImpl('/api/admin/site-settings', { credentials: 'same-origin' })).then(response => response.json());
+    },
+    async save(settings) {
+      await checked(await fetchImpl('/api/admin/site-settings', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(settings), credentials: 'same-origin',
+      }));
+    },
+    async uploadAsset(kind, file) {
+      return checked(await fetchImpl(`/api/admin/site-settings/assets/${encodeURIComponent(kind)}`, {
+        method: 'POST', headers: { 'Content-Type': file.type }, body: file, credentials: 'same-origin',
+      })).then(response => response.json());
+    },
+    async resetAsset(kind) {
+      await checked(await fetchImpl(`/api/admin/site-settings/assets/${encodeURIComponent(kind)}`, { method: 'DELETE', credentials: 'same-origin' }));
+    },
+  };
+}
+
+export function applySiteSettings(settings, doc = document) {
+  const siteName = settings.site_name || 'SafeFileHub';
+  doc.title = `${siteName} transfers`;
+  for (const element of doc.querySelectorAll('[data-site-name]')) element.textContent = siteName;
+  if (/^#[0-9a-f]{6}$/i.test(settings.primary_color || '')) doc.documentElement.style.setProperty('--primary-color', settings.primary_color);
+
+  const setLogo = (selector, url, alt) => {
+    const image = doc.querySelector(selector);
+    if (!image) return;
+    image.alt = alt;
+    if (url) { image.src = url; image.hidden = false; } else { image.removeAttribute('src'); image.hidden = true; }
+  };
+  setLogo('#login-logo', settings.login_logo_url, `${siteName} logo`);
+  setLogo('#nav-logo', settings.nav_logo_url, `${siteName} logo`);
+  const favicon = doc.querySelector('#site-favicon');
+  if (favicon && settings.favicon_url) favicon.href = settings.favicon_url;
+  const filing = doc.querySelector('#filing');
+  if (filing) { filing.textContent = settings.filing_text || ''; filing.hidden = !settings.filing_enabled || !settings.filing_text; }
+}
+
+function setAdminForm(settings, form) {
+  form.elements.site_name.value = settings.site_name || '';
+  form.elements.primary_color.value = settings.primary_color || '#2563eb';
+  form.elements.filing_enabled.checked = Boolean(settings.filing_enabled);
+  form.elements.filing_text.value = settings.filing_text || '';
+  form.elements.md5_enabled.checked = Boolean(settings.md5_enabled);
+}
+
 function mountUI() {
   const form = document.querySelector('#upload-form');
   const input = document.querySelector('#files');
@@ -171,14 +256,22 @@ function mountUI() {
   const root = document.querySelector('#root-id');
   const list = document.querySelector('#uploads');
   const result = document.querySelector('#summary');
+  const fileList = document.querySelector('#file-list');
+  const refreshFiles = document.querySelector('#refresh-files');
+  const filesStatus = document.querySelector('#files-status');
   if (!form || !input || !directory || !root || !list || !result) return;
   form.addEventListener('submit', async event => {
     event.preventDefault();
     const batch = createUploadBatch(input.files, uploadAPI(), { rootID: Number(root.value), directory: directory.value || '/' });
     const render = () => { list.replaceChildren(...batch.items.map(item => {
       const row = document.createElement('li');
-      row.textContent = `${item.path} — ${item.status} (${Math.round(item.progress * 100)}%)`;
-      for (const [label, action] of [['Pause', () => batch.pause(item)], ['Cancel', () => batch.cancel(item)], ['Retry', () => batch.retry(item)]]) {
+      row.className = 'upload-row';
+      const info = document.createElement('div'); info.className = 'upload-info';
+      const title = document.createElement('strong'); title.textContent = item.path;
+      const progress = document.createElement('progress'); progress.className = 'progress'; progress.max = 1; progress.value = item.progress;
+      const state = document.createElement('span'); state.className = 'badge'; state.textContent = ({ queued: '排队中', uploading: '上传中', paused: '已暂停', completed: '已完成', failed: '失败', cancelled: '已取消' })[item.status] || item.status;
+      info.append(title, progress, state); row.append(info);
+      for (const [label, action] of [['暂停', () => batch.pause(item)], ['取消', () => batch.cancel(item)], ['重试', () => batch.retry(item)]]) {
         const button = document.createElement('button'); button.type = 'button'; button.textContent = label;
         button.onclick = async () => { await action(); render(); }; row.append(' ', button);
       }
@@ -188,6 +281,76 @@ function mountUI() {
     const summary = await batch.start();
     render();
     result.textContent = `${summary.completed}/${summary.total} completed; ${summary.failed} failed; ${summary.cancelled} cancelled`;
+    void renderFiles();
+  });
+
+  const api = siteSettingsAPI();
+  const fileAPI = filesAPI();
+  let publicSettings = { md5_enabled: false };
+  const renderFiles = async () => {
+    if (!fileList || !filesStatus) return;
+    try {
+      const response = await fileAPI.list(Number(root.value), directory.value || '/');
+      fileList.replaceChildren(...response.files.map(file => {
+        const row = document.createElement('li');
+        const md5 = formatMD5(file, publicSettings.md5_enabled);
+        row.textContent = `${file.path} — ${file.size} bytes${md5 ? ` — ${md5}` : ''}`;
+        return row;
+      }));
+      filesStatus.textContent = `${response.files.length} files`;
+    } catch (error) { filesStatus.textContent = friendlyError(error); }
+  };
+  if (refreshFiles) refreshFiles.addEventListener('click', () => { void renderFiles(); });
+  const admin = document.querySelector('#admin-settings');
+  const adminForm = document.querySelector('#admin-settings-form');
+  const adminStatus = document.querySelector('#admin-settings-status');
+  const showAdminStatus = message => { if (adminStatus) adminStatus.textContent = message; };
+  const logout = document.querySelector('#logout');
+  if (logout) logout.addEventListener('click', async () => { logout.disabled = true; try { await fetch('/logout', { method: 'POST', credentials: 'same-origin' }); location.assign('/login'); } catch (error) { logout.disabled = false; showAdminStatus(friendlyError(error)); } });
+  const refreshBranding = async () => {
+    const settings = await api.publicSettings();
+    applySiteSettings(settings);
+    publicSettings = settings;
+    return settings;
+  };
+  void refreshBranding().catch(() => {});
+
+  if (!admin || !adminForm) return;
+  void api.adminSettings().then(settings => {
+    setAdminForm(settings, adminForm);
+    admin.hidden = false;
+  }).catch(() => { admin.hidden = true; });
+  adminForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    const fields = adminForm.elements;
+    try {
+      await api.save({
+        site_name: fields.site_name.value,
+        primary_color: fields.primary_color.value,
+        filing_enabled: fields.filing_enabled.checked,
+        filing_text: fields.filing_text.value,
+        md5_enabled: fields.md5_enabled.checked,
+      });
+      await refreshBranding();
+      showAdminStatus('Settings saved.');
+    } catch (error) { showAdminStatus(error.message); }
+  });
+  for (const upload of admin.querySelectorAll('[data-asset-upload]')) upload.addEventListener('change', async event => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      await api.uploadAsset(upload.dataset.assetUpload, file);
+      await refreshBranding();
+      showAdminStatus('Logo uploaded.');
+      event.target.value = '';
+    } catch (error) { showAdminStatus(error.message); }
+  });
+  for (const reset of admin.querySelectorAll('[data-asset-reset]')) reset.addEventListener('click', async () => {
+    try {
+      await api.resetAsset(reset.dataset.assetReset);
+      await refreshBranding();
+      showAdminStatus('Logo reset.');
+    } catch (error) { showAdminStatus(error.message); }
   });
 }
 
