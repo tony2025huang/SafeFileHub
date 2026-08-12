@@ -15,6 +15,17 @@ export function friendlyError(error) {
   return '操作失败，请稍后再试。';
 }
 
+export function selectView(name, doc = document, win = typeof window !== 'undefined' ? window : undefined) {
+  const view = name === 'settings' ? 'settings' : 'files';
+  for (const section of doc.querySelectorAll('[data-view]')) section.hidden = section.dataset.view !== view;
+  for (const link of doc.querySelectorAll('[data-view-link]')) {
+    const active = link.dataset.viewLink === view;
+    link.setAttribute('aria-current', active ? 'page' : 'false');
+  }
+  if (win && win.location.hash !== `#${view}`) win.history.replaceState(null, '', `#${view}`);
+  return view;
+}
+
 function joinPath(directory, relative) {
   const base = directory === '/' ? '' : directory.replace(/\/+$/, '');
   const pieces = relative.replace(/^\/+/, '').split('/').filter(Boolean);
@@ -195,7 +206,7 @@ export function formatMD5(file, enabled) {
 
 export function siteSettingsAPI(fetchImpl = fetch) {
   async function checked(response) {
-    if (!response.ok) throw new Error(`site settings request failed (${response.status})`);
+    if (!response.ok) { const error = new Error('site settings request failed'); error.status = response.status; throw error; }
     return response;
   }
   return {
@@ -260,6 +271,15 @@ function mountUI() {
   const refreshFiles = document.querySelector('#refresh-files');
   const filesStatus = document.querySelector('#files-status');
   if (!form || !input || !directory || !root || !list || !result) return;
+  const settingsView = document.querySelector('[data-view="settings"]');
+  const filesView = document.querySelector('[data-view="files"]');
+  const settingsLink = document.querySelector('[data-view-link="settings"]');
+  const filesLink = document.querySelector('[data-view-link="files"]');
+  const navigate = name => selectView(name);
+  for (const link of [settingsLink, filesLink]) link?.addEventListener('click', event => {
+    event.preventDefault(); navigate(link.dataset.viewLink);
+  });
+  navigate(location.hash === '#settings' ? 'settings' : 'files');
   form.addEventListener('submit', async event => {
     event.preventDefault();
     const batch = createUploadBatch(input.files, uploadAPI(), { rootID: Number(root.value), directory: directory.value || '/' });
@@ -293,14 +313,15 @@ function mountUI() {
     if (!fileList || !filesStatus) return;
     try {
       const response = await fileAPI.list(Number(root.value), directory.value || '/');
-      fileList.replaceChildren(...response.files.map(file => {
+      const files = Array.isArray(response.files) ? response.files : [];
+      fileList.replaceChildren(...files.map(file => {
         const row = document.createElement('li');
         const md5 = formatMD5(file, publicSettings.md5_enabled);
         row.textContent = `${file.path} — ${file.size} bytes${md5 ? ` — ${md5}` : ''}`;
         return row;
       }));
-      filesStatus.textContent = `${response.files.length} files`;
-    } catch (error) { filesStatus.textContent = friendlyError(error); }
+      filesStatus.textContent = files.length ? `${files.length} files` : '当前目录为空。';
+    } catch (error) { fileList.replaceChildren(); filesStatus.textContent = friendlyError(error); }
   };
   if (refreshFiles) refreshFiles.addEventListener('click', () => { void renderFiles(); });
   const admin = document.querySelector('#admin-settings');
@@ -321,7 +342,13 @@ function mountUI() {
   void api.adminSettings().then(settings => {
     setAdminForm(settings, adminForm);
     admin.hidden = false;
-  }).catch(() => { admin.hidden = true; });
+    if (settingsLink) settingsLink.hidden = false;
+  }).catch(error => {
+    admin.hidden = true;
+    if (settingsLink) settingsLink.hidden = true;
+    if (Number(error?.status) === 403) showAdminStatus('仅管理员可使用站点设置。');
+    else if (Number(error?.status) !== 401) showAdminStatus(friendlyError(error));
+  });
   adminForm.addEventListener('submit', async event => {
     event.preventDefault();
     const fields = adminForm.elements;
