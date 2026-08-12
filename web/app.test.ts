@@ -7,6 +7,7 @@ import { readFile } from 'node:fs/promises';
 
 import {
   DEFAULT_PER_FILE_CONCURRENCY,
+  createSessionGuard,
   createUploadBatch,
   encodeLogicalPath,
   filesAPI,
@@ -14,6 +15,69 @@ import {
   friendlyError,
   mutationPath,
 } from './app.ts';
+
+function response(status = 200) { return new Response(null, { status }); }
+
+test('startup session validation redirects and clears only application state when expired', async () => {
+  const removed = [];
+  const navigations = [];
+  const guard = createSessionGuard({
+    fetchImpl: async url => url === '/session' ? response(401) : response(204),
+    navigate: path => navigations.push(path), storage: { removeItem: key => removed.push(key) },
+    win: { location: { pathname: '/' } }, doc: null,
+  });
+  assert.equal(await guard.start(), false);
+  assert.deepEqual(navigations, ['/login']);
+  assert.deepEqual(removed, ['safefilehub_session', 'safefilehub_auth', 'safefilehub_token']);
+});
+
+test('all guarded API responses handle concurrent 401 responses exactly once', async () => {
+  const navigations = [];
+  let logoutCalls = 0;
+  const guard = createSessionGuard({
+    fetchImpl: async url => { if (url === '/logout') logoutCalls++; return response(401); },
+    navigate: path => navigations.push(path), storage: { removeItem() {} },
+    win: { location: { pathname: '/' } }, doc: null,
+  });
+  const settled = await Promise.allSettled([guard.fetch('/api/files'), guard.fetch('/api/uploads')]);
+  assert.equal(settled.filter(result => result.status === 'rejected').length, 2);
+  assert.deepEqual(navigations, ['/login']);
+  assert.equal(logoutCalls, 1);
+});
+
+test('a 403 safely denies only that action without clearing a valid session', async () => {
+  const navigations = [];
+  const guard = createSessionGuard({
+    fetchImpl: async () => response(403), navigate: path => navigations.push(path),
+    storage: { removeItem() {} }, win: { location: { pathname: '/' } }, doc: null,
+  });
+  assert.equal((await guard.fetch('/api/admin/site-settings')).status, 403);
+  assert.equal(guard.invalidated, false);
+  assert.deepEqual(navigations, []);
+});
+
+test('periodic and foreground session checks detect revocation but network errors do not log out', async () => {
+  const timers = [];
+  const navigations = [];
+  let checks = 0;
+  const guard = createSessionGuard({
+    fetchImpl: async url => {
+      if (url === '/logout') return response(204);
+      checks++;
+      if (checks === 1) return response(200);
+      if (checks === 2) throw new TypeError('offline');
+      return response(401);
+    },
+    navigate: path => navigations.push(path), storage: { removeItem() {} },
+    win: { location: { pathname: '/' }, addEventListener() {}, removeEventListener() {} }, doc: null,
+    setIntervalImpl: callback => { timers.push(callback); return 1; }, clearIntervalImpl() {},
+  });
+  assert.equal(await guard.start(), true);
+  await timers[0]();
+  assert.deepEqual(navigations, []);
+  await timers[0]();
+  assert.deepEqual(navigations, ['/login']);
+});
 
 test('friendly errors never expose internal server details', () => {
   assert.equal(friendlyError(Object.assign(new Error('secret stack'), { status: 403 })), '你没有执行此操作的权限。');
@@ -249,4 +313,10 @@ test('deployment HTML exposes dynamic branding controls and all three asset rese
   assert.match(html, /data-asset-reset="login_logo"/);
   assert.match(html, /data-asset-reset="nav_logo"/);
   assert.match(html, /data-asset-reset="favicon"/);
+});
+
+test('login failures use a generic message instead of server error text', async () => {
+  const login = await readFile(new URL('../internal/httpapi/assets/login.html', import.meta.url), 'utf8');
+  assert.doesNotMatch(login, /status\.textContent = error\.message/);
+  assert.match(login, /Unable to sign in\. Check your credentials and connection/);
 });

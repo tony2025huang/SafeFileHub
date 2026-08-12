@@ -3,12 +3,105 @@
 // runner can exercise it when a frontend package/toolchain is not installed.
 
 export const DEFAULT_PER_FILE_CONCURRENCY = 4;
+export const SESSION_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+
+// Authentication is cookie based. Keep all browser-side handling here so an
+// expired/revoked cookie cannot leave a stale transfer UI behind. The server
+// remains the authority: this guard never stores or reads the HttpOnly cookie.
+export function createSessionGuard({
+  fetchImpl = fetch,
+  navigate = path => { if (typeof location !== 'undefined') location.assign(path); },
+  storage = typeof sessionStorage !== 'undefined' ? sessionStorage : undefined,
+  win = typeof window !== 'undefined' ? window : undefined,
+  doc = typeof document !== 'undefined' ? document : undefined,
+  setIntervalImpl = setInterval,
+  clearIntervalImpl = clearInterval,
+  intervalMs = SESSION_CHECK_INTERVAL_MS,
+} = {}) {
+  let invalidated = false;
+  let checkInFlight = null;
+  let timer = null;
+  const listeners = [];
+  const clearClientState = () => {
+    // These are legacy/application-owned names only; never erase unrelated
+    // storage belonging to other same-origin applications.
+    for (const key of ['safefilehub_session', 'safefilehub_auth', 'safefilehub_token']) {
+      try { storage?.removeItem(key); } catch (_) {}
+    }
+  };
+  const authError = () => Object.assign(new Error('authentication required'), { status: 401 });
+  const goLogin = () => {
+    if (!win || win.location?.pathname !== '/login') navigate('/login');
+  };
+  const invalidate = () => {
+    if (invalidated) return;
+    invalidated = true;
+    if (timer !== null) { clearIntervalImpl(timer); timer = null; }
+    clearClientState();
+    // Clear a still-valid cookie after the server reports the authenticated
+    // session is invalid. Do not wait for this best-effort request before leaving.
+    void fetchImpl('/logout', { method: 'POST', credentials: 'same-origin' }).catch(() => {});
+    goLogin();
+  };
+  const inspect = response => {
+    // A 403 means the authenticated user lacks access to this resource (for
+    // example, a non-admin probing the settings endpoint). It must stop that
+    // action without destroying an otherwise valid session. A 401 is the
+    // server's unambiguous signal that the session has expired or was revoked.
+    if (response?.status === 401) invalidate();
+    return response;
+  };
+  const request = async (input, init) => {
+    if (invalidated) throw authError();
+    const response = inspect(await fetchImpl(input, init));
+    if (invalidated) throw authError();
+    return response;
+  };
+  const check = () => {
+    if (invalidated) return Promise.resolve(false);
+    if (checkInFlight) return checkInFlight;
+    checkInFlight = (async () => {
+      try {
+        const response = inspect(await fetchImpl('/session', { credentials: 'same-origin', cache: 'no-store' }));
+        return Boolean(response?.ok) && !invalidated;
+      } catch (_) {
+        // A network failure is not proof of expiry. Preserve local work and
+        // retry on the next interval/focus rather than logging the user out.
+        return false;
+      } finally { checkInFlight = null; }
+    })();
+    return checkInFlight;
+  };
+  const start = async () => {
+    const active = await check();
+    if (!active || invalidated) return false;
+    if (timer === null) timer = setIntervalImpl(() => { void check(); }, intervalMs);
+    const onFocus = () => { void check(); };
+    const onVisibility = () => { if (!doc?.hidden) void check(); };
+    const onPageShow = () => { void check(); };
+    for (const [target, name, listener] of [[win, 'focus', onFocus], [win, 'pageshow', onPageShow], [doc, 'visibilitychange', onVisibility]]) {
+      target?.addEventListener?.(name, listener);
+      listeners.push([target, name, listener]);
+    }
+    return true;
+  };
+  const stop = () => {
+    if (timer !== null) { clearIntervalImpl(timer); timer = null; }
+    for (const [target, name, listener] of listeners.splice(0)) target?.removeEventListener?.(name, listener);
+  };
+  const logout = async () => {
+    const response = await fetchImpl('/logout', { method: 'POST', credentials: 'same-origin' });
+    if (!response.ok) { const error = new Error('logout failed'); error.status = response.status; throw error; }
+    invalidate();
+  };
+  return { fetch: request, check, start, stop, logout, invalidate, get invalidated() { return invalidated; } };
+}
 
 export function friendlyError(error) {
   const status = Number(error?.status || 0);
-  if (status === 401) { if (typeof location !== 'undefined') location.assign('/login'); return '登录已过期，请重新登录。'; }
-  if (status === 400) return '请求无法处理，请检查文件名或路径后重试。';
+  if (status === 401) return '登录已过期，请重新登录。';
   if (status === 403) return '你没有执行此操作的权限。';
+  if (status === 400) return '请求无法处理，请检查文件名或路径后重试。';
   if (status === 409) return '文件状态已变化，请刷新后重试。';
   if (status === 429) return '操作太频繁，请稍后再试。';
   if (status >= 500) return '服务暂时不可用，请稍后再试。';
@@ -307,6 +400,10 @@ function mountUI() {
   const breadcrumb = document.querySelector('#breadcrumb');
   const fileActions = document.querySelector('#file-actions');
   if (!form || !input || !directories || !list || !result) return;
+  const session = createSessionGuard();
+  // Begin validation before wiring protected UI actions. API calls remain
+  // guarded too, covering requests made while this initial probe is pending.
+  const sessionReady = session.start();
   let selectedInput = input;
   let queuedFiles = [];
   let queuedBatch = null;
@@ -337,7 +434,7 @@ function mountUI() {
     if (uploadStarted) return;
     const seen = new Set(queuedFiles.map(file => `${file.webkitRelativePath || file.name}\u0000${file.size}\u0000${file.lastModified || 0}`));
     for (const file of files) { const key = `${file.webkitRelativePath || file.name}\u0000${file.size}\u0000${file.lastModified || 0}`; if (!seen.has(key)) { queuedFiles.push(file); seen.add(key); } }
-    queuedBatch = createUploadBatch(queuedFiles, uploadAPI(), { rootID: Number(root.value), directory: directory.value || '/', onProgress: () => renderQueue(queuedBatch) });
+    queuedBatch = createUploadBatch(queuedFiles, uploadAPI(session.fetch), { rootID: Number(root.value), directory: directory.value || '/', onProgress: () => renderQueue(queuedBatch) });
     renderQueue(queuedBatch); result.textContent = `${queuedBatch.items.length} 项待上传`; input.value = ''; directories.value = '';
   };
   input.addEventListener('change', () => addSelectedFiles(input.files));
@@ -352,8 +449,8 @@ function mountUI() {
     void renderFiles();
   });
 
-  const api = siteSettingsAPI();
-  const fileAPI = filesAPI();
+  const api = siteSettingsAPI(session.fetch);
+  const fileAPI = filesAPI(session.fetch);
   let publicSettings = { md5_enabled: false };
   let listedFiles = [];
   const renderFiles = async () => {
@@ -398,17 +495,26 @@ function mountUI() {
   const adminStatus = document.querySelector('#admin-settings-status');
   const showAdminStatus = message => { if (adminStatus) adminStatus.textContent = message; };
   const logout = document.querySelector('#logout');
-  if (logout) logout.addEventListener('click', async () => { logout.disabled = true; try { await fetch('/logout', { method: 'POST', credentials: 'same-origin' }); location.assign('/login'); } catch (error) { logout.disabled = false; showAdminStatus(friendlyError(error)); } });
+  if (logout) logout.addEventListener('click', async () => { logout.disabled = true; try { await session.logout(); } catch (error) { logout.disabled = false; showAdminStatus(friendlyError(error)); } });
   const refreshBranding = async () => {
     const settings = await api.publicSettings();
     applySiteSettings(settings);
     publicSettings = settings;
     return settings;
   };
-  void refreshBranding().catch(() => {});
+  void (async () => {
+    // Do not render protected data merely because the shell was restored from
+    // browser cache. The real /session endpoint validates the server session.
+    if (!await sessionReady) return;
+    await refreshBranding().catch(() => {});
+    await renderFiles();
+  })();
 
   if (!admin || !adminForm) return;
-  void api.adminSettings().then(settings => {
+  void sessionReady.then(active => {
+    if (!active) throw Object.assign(new Error('authentication required'), { status: 401 });
+    return api.adminSettings();
+  }).then(settings => {
     setAdminForm(settings, adminForm);
     admin.hidden = false;
     if (settingsLink) settingsLink.hidden = false;
