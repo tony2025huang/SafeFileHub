@@ -177,7 +177,7 @@ func TestMD5ClaimIsUniqueAcrossConnectionsAndRecoveryBounded(t *testing.T) {
 	if len(seen) != 2 {
 		t.Fatalf("claims = %d, want 2", len(seen))
 	}
-	if n, err := one.RequeueComputingMD5Tasks(ctx, 1); err != nil || n != 1 {
+	if n, err := one.RequeueComputingMD5Tasks(ctx, 1, time.Now().Add(time.Second)); err != nil || n != 1 {
 		t.Fatalf("requeue = %d, %v", n, err)
 	}
 }

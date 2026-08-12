@@ -18,6 +18,7 @@ import (
 
 type adminRepository interface {
 	UserByID(context.Context, int64) (db.User, error)
+	IsBootstrapAdmin(context.Context, int64) (bool, error)
 	CreateUser(context.Context, db.User) (db.User, error)
 	UpdateUserCredentials(context.Context, int64, string, bool) error
 	StorageRootByID(context.Context, int64) (db.StorageRoot, error)
@@ -84,7 +85,8 @@ func requireAdmin(cfg config.Config, repo adminRepository, next http.Handler) ht
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id, _ := r.Context().Value(sessionUserIDKey{}).(int64)
 		u, err := repo.UserByID(r.Context(), id)
-		if err != nil || !isAdmin(cfg.AdminUsernames, u) {
+		bootstrap, bootstrapErr := repo.IsBootstrapAdmin(r.Context(), id)
+		if err != nil || bootstrapErr != nil || !isAdmin(cfg.AdminUsernames, u, bootstrap) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
@@ -92,12 +94,10 @@ func requireAdmin(cfg config.Config, repo adminRepository, next http.Handler) ht
 	})
 }
 
-// isAdmin recognizes user ID 1 as the durable initial administrator. Bootstrap
-// and reset both create or replace that exact record, so this authorization
-// does not depend on logging a generated username into production config. The
+// isAdmin recognizes the explicitly recorded bootstrap administrator. The
 // configured usernames remain supported for explicitly provisioned admins.
-func isAdmin(names []string, user db.User) bool {
-	if user.ID == 1 {
+func isAdmin(names []string, user db.User, bootstrap bool) bool {
+	if bootstrap {
 		return true
 	}
 	for _, name := range names {

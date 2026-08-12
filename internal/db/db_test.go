@@ -85,7 +85,7 @@ func TestMigrateRecordsVersionsAndDoesNotReplayAppliedMigrations(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate migration versions: %v", err)
 	}
-	if want := []string{"001_initial", "002_permission_denies", "003_upload_session_length", "004_upload_session_lifecycle", "005_audit_event_status", "006_directories", "007_published_lifecycle", "008_published_parent_invariant", "009_site_settings_md5", "010_site_asset_cleanup"}; fmt.Sprint(versions) != fmt.Sprint(want) {
+	if want := []string{"001_initial", "002_permission_denies", "003_upload_session_length", "004_upload_session_lifecycle", "005_audit_event_status", "006_directories", "007_published_lifecycle", "008_published_parent_invariant", "009_site_settings_md5", "010_site_asset_cleanup", "011_bootstrap_admin"}; fmt.Sprint(versions) != fmt.Sprint(want) {
 		t.Fatalf("migration versions = %v, want %v", versions, want)
 	}
 

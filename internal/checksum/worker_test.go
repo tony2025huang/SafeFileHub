@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,12 +17,13 @@ import (
 )
 
 type fakeTasks struct {
-	tasks     []db.MD5Task
-	files     map[int64]db.File
-	complete  map[int64]string
-	failed    map[int64]string
-	recovered int
-	mu        sync.Mutex
+	tasks       []db.MD5Task
+	files       map[int64]db.File
+	complete    map[int64]string
+	failed      map[int64]string
+	completeErr error
+	recovered   int
+	mu          sync.Mutex
 }
 
 type blockingClaimTasks struct {
@@ -37,7 +40,7 @@ func (f *blockingClaimTasks) ClaimMD5Task(ctx context.Context) (db.MD5Task, erro
 	return db.MD5Task{}, ctx.Err()
 }
 
-func (f *fakeTasks) RequeueComputingMD5Tasks(context.Context, int) (int, error) {
+func (f *fakeTasks) RequeueComputingMD5Tasks(context.Context, int, time.Time) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.recovered++
@@ -64,8 +67,23 @@ func (f *fakeTasks) FileByID(_ context.Context, id int64) (db.File, error) {
 	return v, nil
 }
 func (f *fakeTasks) CompleteMD5Task(_ context.Context, id int64, d string) error {
+	if f.completeErr != nil {
+		return f.completeErr
+	}
 	f.complete[id] = d
 	return nil
+}
+
+func TestWorkerReturnsCompletionWriteFailureForLeaseRecovery(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "object"), []byte("data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f := &fakeTasks{tasks: []db.MD5Task{{FileID: 7}}, files: map[int64]db.File{7: {ID: 7, ObjectKey: "object"}}, complete: map[int64]string{}, failed: map[int64]string{}, completeErr: errors.New("database write failed")}
+	w := NewWorker(f, localObjects{dir}, Options{MaxTasksPerRun: 1})
+	if _, err := w.RunOnce(context.Background()); err == nil || !strings.Contains(err.Error(), "database write failed") {
+		t.Fatalf("RunOnce error = %v", err)
+	}
 }
 func (f *fakeTasks) FailMD5Task(_ context.Context, id int64, e string) error {
 	f.failed[id] = e

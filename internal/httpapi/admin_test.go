@@ -25,11 +25,6 @@ func TestAdminUserAndPermissionManagement(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer repo.Close()
-	// Reserve ID 1 for the durable initial-admin identity. The configured
-	// username below must still authorize a separate, non-initial admin.
-	if _, err := repo.CreateUser(ctx, db.User{Username: "initial", PasswordHash: "initial-hash"}); err != nil {
-		t.Fatal(err)
-	}
 	adminHash, err := auth.HashPassword("admin-password")
 	if err != nil {
 		t.Fatal(err)
@@ -112,15 +107,18 @@ func TestBootstrapAdminAuthorizesWithEmptyConfiguredUsernames(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer repo.Close()
+	ordinary, err := repo.CreateUser(ctx, db.User{Username: "ordinary-first-user", PasswordHash: "hash"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ordinary.ID != 1 {
+		t.Fatalf("ordinary user ID = %d, want 1", ordinary.ID)
+	}
 	initial, err := repo.CreateUser(ctx, db.User{Username: "sfh-random-bootstrap-name", PasswordHash: "hash"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if initial.ID != 1 {
-		t.Fatalf("initial user ID = %d, want 1", initial.ID)
-	}
-	member, err := repo.CreateUser(ctx, db.User{Username: "member", PasswordHash: "hash"})
-	if err != nil {
+	if err := repo.SetBootstrapAdmin(ctx, initial.ID); err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.Default() // Production defaults deliberately do not need a plaintext username.
@@ -140,7 +138,7 @@ func TestBootstrapAdminAuthorizesWithEmptyConfiguredUsernames(t *testing.T) {
 	}
 	created.Body.Close()
 
-	forbidden := adminHTTPJSON(t, server, adminSession(t, sessions, member.ID), `{"username":"not-allowed","password":"password"}`)
+	forbidden := adminHTTPJSON(t, server, adminSession(t, sessions, ordinary.ID), `{"username":"not-allowed","password":"password"}`)
 	defer forbidden.Body.Close()
 	if forbidden.StatusCode != http.StatusForbidden {
 		t.Fatalf("non-bootstrap user with empty configured usernames = %d, want 403", forbidden.StatusCode)

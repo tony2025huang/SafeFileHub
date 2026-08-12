@@ -364,6 +364,67 @@ func (r *Repository) UserByID(ctx context.Context, id int64) (User, error) {
 	return scanUser(row)
 }
 
+// IsBootstrapAdmin reports whether userID is the explicitly recorded initial
+// administrator. It never infers authority from a user ID.
+func (r *Repository) IsBootstrapAdmin(ctx context.Context, userID int64) (bool, error) {
+	var exists bool
+	err := r.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM bootstrap_admin WHERE id=1 AND user_id=?)`, userID).Scan(&exists)
+	return exists, err
+}
+
+// BootstrapAdmin returns the explicitly recorded initial administrator.
+func (r *Repository) BootstrapAdmin(ctx context.Context) (User, error) {
+	row := r.db.QueryRowContext(ctx, `SELECT u.id, u.username, u.password_hash, u.disabled, u.created_at, u.updated_at FROM users u JOIN bootstrap_admin b ON b.user_id=u.id WHERE b.id=1`)
+	return scanUser(row)
+}
+
+// SetBootstrapAdmin records a newly-created user as the singleton bootstrap
+// administrator. The record is immutable through normal administration APIs.
+func (r *Repository) SetBootstrapAdmin(ctx context.Context, userID int64) error {
+	now := unixNano(time.Now().UTC())
+	_, err := r.db.ExecContext(ctx, `INSERT INTO bootstrap_admin(id,user_id,created_at,updated_at) VALUES(1,?,?,?)`, userID, now, now)
+	return classifyError(err)
+}
+
+// AdoptLegacyBootstrapAdmin explicitly records the only identity shape emitted
+// by pre-role SafeFileHub bootstrap: sfh- plus 24 random bytes encoded with
+// base64.RawURLEncoding. Callers must validate the name before invoking this;
+// it intentionally never adopts an arbitrary first user.
+func (r *Repository) AdoptLegacyBootstrapAdmin(ctx context.Context, userID int64) error {
+	return r.SetBootstrapAdmin(ctx, userID)
+}
+
+// CreateBootstrapAdmin creates the user and records its bootstrap role in one
+// transaction, preventing an unmarked user if process startup is interrupted.
+func (r *Repository) CreateBootstrapAdmin(ctx context.Context, user User) (User, error) {
+	createdAt := utcOrNow(user.CreatedAt)
+	updatedAt := utcOrNow(user.UpdatedAt)
+	if user.UpdatedAt.IsZero() {
+		updatedAt = createdAt
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return User{}, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `INSERT INTO users (username,password_hash,disabled,created_at,updated_at) VALUES(?,?,?,?,?)`, user.Username, user.PasswordHash, boolInt(user.Disabled), unixNano(createdAt), unixNano(updatedAt))
+	if err != nil {
+		return User{}, classifyError(err)
+	}
+	user.ID, err = result.LastInsertId()
+	if err != nil {
+		return User{}, fmt.Errorf("get bootstrap admin id: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO bootstrap_admin(id,user_id,created_at,updated_at) VALUES(1,?,?,?)`, user.ID, unixNano(createdAt), unixNano(updatedAt)); err != nil {
+		return User{}, classifyError(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return User{}, err
+	}
+	user.CreatedAt, user.UpdatedAt = createdAt, updatedAt
+	return user, nil
+}
+
 // UpdateUserCredentials changes password material and/or disabled state without
 // exposing the resulting hash to callers. It is deliberately conditional so a
 // missing target cannot be mistaken for a successful management operation.
@@ -382,9 +443,10 @@ func (r *Repository) UpdateUserCredentials(ctx context.Context, id int64, passwo
 	return nil
 }
 
-// ResetInitialAdmin atomically replaces only user id 1 credentials and identity.
+// ResetInitialAdmin atomically replaces only the explicitly recorded bootstrap
+// administrator credentials and identity.
 func (r *Repository) ResetInitialAdmin(ctx context.Context, username, passwordHash string) error {
-	result, err := r.db.ExecContext(ctx, `UPDATE users SET username=?, password_hash=?, disabled=0, updated_at=? WHERE id=1`, username, passwordHash, unixNano(time.Now().UTC()))
+	result, err := r.db.ExecContext(ctx, `UPDATE users SET username=?, password_hash=?, disabled=0, updated_at=? WHERE id=(SELECT user_id FROM bootstrap_admin WHERE id=1)`, username, passwordHash, unixNano(time.Now().UTC()))
 	if err != nil {
 		return classifyError(err)
 	}
@@ -1005,6 +1067,9 @@ func boolInt(value bool) int {
 }
 
 func classifyError(err error) error {
+	if err == nil {
+		return nil
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -1087,12 +1152,14 @@ func (r *Repository) FailMD5Task(ctx context.Context, fileID int64, message stri
 	return tx.Commit()
 }
 
-// RequeueComputingMD5Tasks recovers at most limit interrupted claims on startup.
-func (r *Repository) RequeueComputingMD5Tasks(ctx context.Context, limit int) (int, error) {
+// RequeueComputingMD5Tasks recovers at most limit computing claims whose lease
+// expired before staleBefore. It is safe to run repeatedly during normal work.
+func (r *Repository) RequeueComputingMD5Tasks(ctx context.Context, limit int, staleBefore time.Time) (int, error) {
 	if limit <= 0 {
 		return 0, nil
 	}
-	result, err := r.db.ExecContext(ctx, `UPDATE md5_tasks SET status='pending',claimed_at=NULL,available_at=?,updated_at=? WHERE file_id IN (SELECT file_id FROM md5_tasks WHERE status='computing' ORDER BY claimed_at,file_id LIMIT ?)`, unixNano(time.Now().UTC()), unixNano(time.Now().UTC()), limit)
+	now := unixNano(time.Now().UTC())
+	result, err := r.db.ExecContext(ctx, `UPDATE md5_tasks SET status='pending',claimed_at=NULL,available_at=?,updated_at=? WHERE file_id IN (SELECT file_id FROM md5_tasks WHERE status='computing' AND claimed_at<=? ORDER BY claimed_at,file_id LIMIT ?)`, now, now, unixNano(staleBefore), limit)
 	if err != nil {
 		return 0, err
 	}

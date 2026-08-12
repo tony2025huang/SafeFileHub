@@ -16,7 +16,7 @@ import (
 )
 
 type Tasks interface {
-	RequeueComputingMD5Tasks(context.Context, int) (int, error)
+	RequeueComputingMD5Tasks(context.Context, int, time.Time) (int, error)
 	ClaimMD5Task(context.Context) (db.MD5Task, error)
 	FileByID(context.Context, int64) (db.File, error)
 	CompleteMD5Task(context.Context, int64, string) error
@@ -25,13 +25,14 @@ type Tasks interface {
 type Objects interface {
 	Open(string) (io.ReadCloser, error)
 }
-type Options struct{ Concurrency, MaxTasksPerRun, RecoveryLimit int }
+type Options struct {
+	Concurrency, MaxTasksPerRun, RecoveryLimit int
+	Lease                                      time.Duration
+}
 type Worker struct {
-	tasks     Tasks
-	objects   Objects
-	options   Options
-	recovered bool
-	mu        sync.Mutex
+	tasks   Tasks
+	objects Objects
+	options Options
 }
 
 func NewWorker(tasks Tasks, objects Objects, options Options) *Worker {
@@ -43,6 +44,9 @@ func NewWorker(tasks Tasks, objects Objects, options Options) *Worker {
 	}
 	if options.RecoveryLimit <= 0 {
 		options.RecoveryLimit = options.MaxTasksPerRun
+	}
+	if options.Lease <= 0 {
+		options.Lease = 5 * time.Minute
 	}
 	return &Worker{tasks: tasks, objects: objects, options: options}
 }
@@ -73,19 +77,16 @@ func (w *Worker) Run(ctx context.Context, interval time.Duration) error {
 	}
 }
 
-// RunOnce first performs a single bounded crash recovery, then processes at most MaxTasksPerRun due tasks.
+// RunOnce boundedly requeues stale computing claims before each batch, then
+// processes at most MaxTasksPerRun due tasks. This recovers both a process
+// crash and a worker whose persistence write failed after claiming a task.
 func (w *Worker) RunOnce(ctx context.Context) (int, error) {
-	w.mu.Lock()
-	if !w.recovered {
-		if _, err := w.tasks.RequeueComputingMD5Tasks(ctx, w.options.RecoveryLimit); err != nil {
-			w.mu.Unlock()
-			return 0, fmt.Errorf("recover md5 tasks: %w", err)
-		}
-		w.recovered = true
+	if _, err := w.tasks.RequeueComputingMD5Tasks(ctx, w.options.RecoveryLimit, time.Now().UTC().Add(-w.options.Lease)); err != nil {
+		return 0, fmt.Errorf("recover md5 tasks: %w", err)
 	}
-	w.mu.Unlock()
 	jobs := make(chan db.MD5Task)
 	var wg sync.WaitGroup
+	processErrs := make(chan error, w.options.MaxTasksPerRun)
 	var done int
 	var doneMu sync.Mutex
 	for range w.options.Concurrency {
@@ -93,7 +94,9 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 		go func() {
 			defer wg.Done()
 			for t := range jobs {
-				w.process(ctx, t)
+				if err := w.process(ctx, t); err != nil {
+					processErrs <- err
+				}
 				doneMu.Lock()
 				done++
 				doneMu.Unlock()
@@ -125,31 +128,39 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 	}
 	close(jobs)
 	wg.Wait()
+	close(processErrs)
+	for err := range processErrs {
+		if err != nil {
+			return done, fmt.Errorf("persist md5 task: %w", err)
+		}
+	}
 	return done, nil
 }
-func (w *Worker) process(ctx context.Context, task db.MD5Task) {
+func (w *Worker) process(ctx context.Context, task db.MD5Task) error {
 	file, err := w.tasks.FileByID(ctx, task.FileID)
 	if errors.Is(err, db.ErrNotFound) {
-		return
+		return nil
 	}
 	if err != nil {
-		_ = w.tasks.FailMD5Task(ctx, task.FileID, err.Error())
-		return
+		return w.tasks.FailMD5Task(ctx, task.FileID, err.Error())
 	}
 	r, err := w.objects.Open(file.ObjectKey)
 	if errors.Is(err, fs.ErrNotExist) {
-		_ = w.tasks.FailMD5Task(ctx, task.FileID, "object missing")
-		return
+		return w.tasks.FailMD5Task(ctx, task.FileID, "object missing")
 	}
 	if err != nil {
-		_ = w.tasks.FailMD5Task(ctx, task.FileID, err.Error())
-		return
+		return w.tasks.FailMD5Task(ctx, task.FileID, err.Error())
 	}
 	defer r.Close()
 	h := md5.New()
 	if _, err = io.Copy(h, r); err != nil {
-		_ = w.tasks.FailMD5Task(ctx, task.FileID, err.Error())
-		return
+		return w.tasks.FailMD5Task(ctx, task.FileID, err.Error())
 	}
-	_ = w.tasks.CompleteMD5Task(ctx, task.FileID, hex.EncodeToString(h.Sum(nil)))
+	if err := w.tasks.CompleteMD5Task(ctx, task.FileID, hex.EncodeToString(h.Sum(nil))); err != nil {
+		// The task remains computing when completion persistence fails. Do not
+		// overwrite a possible concurrent terminal transition; the bounded lease
+		// recovery pass will safely make this claim available again.
+		return err
+	}
+	return nil
 }

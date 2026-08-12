@@ -100,8 +100,8 @@ func TestNewProductionServerInitialAdminAccessesSiteSettingsWithDefaultConfig(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if initial.ID != 1 {
-		t.Fatalf("initial user ID = %d, want 1", initial.ID)
+	if err := repo.SetBootstrapAdmin(ctx, initial.ID); err != nil {
+		t.Fatal(err)
 	}
 	store, err := storage.NewObjectStore(cfg.StorageRoot)
 	if err != nil {

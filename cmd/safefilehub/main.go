@@ -26,6 +26,7 @@ import (
 	appLog "github.com/example/safefilehub/internal/observability"
 	"github.com/example/safefilehub/internal/permission"
 	"github.com/example/safefilehub/internal/publishedrecovery"
+	"github.com/example/safefilehub/internal/siteassets"
 	"github.com/example/safefilehub/internal/storage"
 	"github.com/example/safefilehub/internal/upload"
 )
@@ -197,6 +198,21 @@ func runWithLifecycle(lifecycle context.Context, args []string, cfg config.Confi
 				}
 			}
 			log.Printf("SafeFileHub upload recovery: checked=%d kept=%d cleaned=%d orphans=%d dry_run=%t limit=%d", report.Checked, report.Kept, report.Cancelled, report.Orphans, opts.dryRun, opts.limit)
+		}
+	}
+	if opts.recoverOnStart {
+		assets, assetErr := siteassets.New(cfg.StorageRoot, siteassets.Limits{MaxBytes: 8 << 20, MaxPixels: 20_000_000})
+		if assetErr != nil {
+			log.Printf("SafeFileHub site asset cleanup unavailable: %v", assetErr)
+		} else {
+			ctx, cancel := context.WithTimeout(lifecycle, 10*time.Second)
+			completed, cleanupErr := siteassets.RecoverCleanup(ctx, repo, assets, opts.limit)
+			cancel()
+			if cleanupErr != nil {
+				log.Printf("SafeFileHub site asset cleanup failed: %v", cleanupErr)
+			} else {
+				log.Printf("SafeFileHub site asset cleanup: completed=%d limit=%d", completed, opts.limit)
+			}
 		}
 	}
 	if opts.recoverOnStart {

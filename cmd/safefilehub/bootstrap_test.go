@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"github.com/example/safefilehub/internal/auth"
 	"github.com/example/safefilehub/internal/db"
 	"strings"
@@ -22,7 +23,7 @@ func TestBootstrapCreatesRandomLoginOnlyOnceAndStoresHash(t *testing.T) {
 	if first.Password == "" || first.Username == "" || strings.Contains(first.Username, "admin") {
 		t.Fatalf("unsafe bootstrap %#v", first)
 	}
-	u, e := repo.UserByID(context.Background(), 1)
+	u, e := repo.BootstrapAdmin(context.Background())
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -52,8 +53,59 @@ func TestResetInitialAdminFailsWhenMissingAndResetsExisting(t *testing.T) {
 	if e != nil || next.Password == first.Password {
 		t.Fatalf("reset %#v %v", next, e)
 	}
-	u, _ := repo.UserByID(context.Background(), 1)
+	u, _ := repo.BootstrapAdmin(context.Background())
 	if u.Disabled || !auth.VerifyPassword(u.PasswordHash, next.Password) {
 		t.Fatal("reset credentials bad")
+	}
+}
+
+func TestBootstrapDoesNotPromoteExistingFirstUser(t *testing.T) {
+	cfg := testConfig(t)
+	repo, err := db.Open(context.Background(), cfg.SQLitePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	ordinary, err := repo.CreateUser(context.Background(), db.User{Username: "ordinary", PasswordHash: "hash"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ordinary.ID != 1 {
+		t.Fatalf("ordinary user ID = %d, want 1", ordinary.ID)
+	}
+	created, err := bootstrapInitialAdmin(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created.Created {
+		t.Fatal("bootstrap admin was not created")
+	}
+	if bootstrap, err := repo.IsBootstrapAdmin(context.Background(), ordinary.ID); err != nil || bootstrap {
+		t.Fatalf("ordinary first user bootstrap=%t err=%v", bootstrap, err)
+	}
+	bootstrap, err := repo.BootstrapAdmin(context.Background())
+	if err != nil || bootstrap.ID == ordinary.ID || bootstrap.Username != created.Username {
+		t.Fatalf("bootstrap=%#v err=%v", bootstrap, err)
+	}
+}
+
+func TestBootstrapAdoptsOnlyLegacyGeneratedIdentity(t *testing.T) {
+	cfg := testConfig(t)
+	repo, err := db.Open(context.Background(), cfg.SQLitePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	legacyName := "sfh-" + base64.RawURLEncoding.EncodeToString(make([]byte, 24))
+	legacy, err := repo.CreateUser(context.Background(), db.User{Username: legacyName, PasswordHash: "hash"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bootstrapInitialAdmin(context.Background(), repo); err != nil {
+		t.Fatal(err)
+	}
+	bootstrap, err := repo.BootstrapAdmin(context.Background())
+	if err != nil || bootstrap.ID != legacy.ID {
+		t.Fatalf("legacy bootstrap=%#v err=%v", bootstrap, err)
 	}
 }

@@ -264,13 +264,5 @@ func cleanupSiteAssets(ctx context.Context, repo siteSettingsRepository, store s
 	if !ok {
 		return
 	}
-	keys, err := repo.SiteAssetCleanupKeys(ctx, 16)
-	if err != nil {
-		return
-	}
-	for _, key := range keys {
-		if removable.Remove(key) == nil {
-			_ = repo.CompleteSiteAssetCleanup(ctx, key)
-		}
-	}
+	_, _ = siteassets.RecoverCleanup(ctx, repo, removable, 16)
 }
