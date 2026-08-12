@@ -187,13 +187,14 @@ export function uploadAPI(fetchImpl = fetch) {
 }
 
 export function filesAPI(fetchImpl = fetch) {
+  async function checked(response) { if (!response.ok) { const error = new Error('request failed'); error.status = response.status; throw error; } return response; }
   return {
     async list(rootID, path = '/') {
       if (!Number.isInteger(rootID) || rootID <= 0) throw new Error('a positive rootID is required');
-      const response = await fetchImpl(`/roots/${rootID}/files?path=${encodeLogicalPath(path)}`, { credentials: 'same-origin' });
-      if (!response.ok) { const error = new Error('request failed'); error.status = response.status; throw error; }
-      return response.json();
+      return checked(await fetchImpl(`/roots/${rootID}/files?path=${encodeLogicalPath(path)}`, { credentials: 'same-origin' })).then(response => response.json());
     },
+    async createDirectory(rootID, path) { await checked(await fetchImpl('/api/directories', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({root_id: rootID, path: encodeLogicalPath(path)}), credentials:'same-origin' })); },
+    async createFile(rootID, path) { await checked(await fetchImpl('/api/files', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({root_id: rootID, path: encodeLogicalPath(path)}), credentials:'same-origin' })); },
   };
 }
 
@@ -270,6 +271,9 @@ function mountUI() {
   const fileList = document.querySelector('#file-list');
   const refreshFiles = document.querySelector('#refresh-files');
   const filesStatus = document.querySelector('#files-status');
+  const fileSearch = document.querySelector('#file-search');
+  const breadcrumb = document.querySelector('#breadcrumb');
+  const fileActions = document.querySelector('#file-actions');
   if (!form || !input || !directory || !root || !list || !result) return;
   const settingsView = document.querySelector('[data-view="settings"]');
   const filesView = document.querySelector('[data-view="files"]');
@@ -309,21 +313,30 @@ function mountUI() {
   const api = siteSettingsAPI();
   const fileAPI = filesAPI();
   let publicSettings = { md5_enabled: false };
+  let listedFiles = [];
   const renderFiles = async () => {
     if (!fileList || !filesStatus) return;
+    filesStatus.textContent = '正在加载文件…';
     try {
       const response = await fileAPI.list(Number(root.value), directory.value || '/');
-      const files = Array.isArray(response.files) ? response.files : [];
+      listedFiles = Array.isArray(response.files) ? response.files : [];
+      const query = (fileSearch?.value || '').trim().toLowerCase();
+      const files = listedFiles.filter(file => !query || `${file.name} ${file.path}`.toLowerCase().includes(query));
+      files.sort((a,b) => Number(Boolean(b.is_directory)) - Number(Boolean(a.is_directory)) || a.name.localeCompare(b.name));
       fileList.replaceChildren(...files.map(file => {
-        const row = document.createElement('li');
-        const md5 = formatMD5(file, publicSettings.md5_enabled);
-        row.textContent = `${file.path} — ${file.size} bytes${md5 ? ` — ${md5}` : ''}`;
-        return row;
+        const row = document.createElement('li'); row.className = 'file-row';
+        const name = document.createElement('strong'); name.textContent = `${file.is_directory ? '📁' : '📄'} ${file.name || file.path}`;
+        const meta = document.createElement('span'); meta.className = 'file-meta';
+        meta.textContent = file.is_directory ? '文件夹' : `${file.size ?? 0} bytes${formatMD5(file, publicSettings.md5_enabled) ? ` · ${formatMD5(file, publicSettings.md5_enabled)}` : ''}`;
+        row.append(name, meta); return row;
       }));
-      filesStatus.textContent = files.length ? `${files.length} files` : '当前目录为空。';
+      filesStatus.textContent = files.length ? `${files.length} 项` : (query ? '没有匹配的文件。' : '当前目录为空。');
+      if (breadcrumb) breadcrumb.textContent = directory.value || '/';
     } catch (error) { fileList.replaceChildren(); filesStatus.textContent = friendlyError(error); }
   };
   if (refreshFiles) refreshFiles.addEventListener('click', () => { void renderFiles(); });
+  if (fileSearch) fileSearch.addEventListener('input', () => { const query = fileSearch.value.trim().toLowerCase(); const filtered = listedFiles.filter(file => !query || `${file.name} ${file.path}`.toLowerCase().includes(query)); fileList?.replaceChildren(...filtered.map(file => { const row=document.createElement('li'); row.className='file-row'; row.textContent=`${file.is_directory ? '📁' : '📄'} ${file.name || file.path} · ${file.is_directory ? '文件夹' : `${file.size ?? 0} bytes`}`; return row; })); filesStatus.textContent = filtered.length ? `${filtered.length} 项` : (query ? '没有匹配的文件。' : '当前目录为空。'); });
+  if (fileActions) fileActions.addEventListener('click', async event => { const button = event.target.closest('button[data-action]'); if (!button || !['mkdir', 'text'].includes(button.dataset.action)) return; const name = prompt(button.dataset.action === 'mkdir' ? '新建目录名称' : '新建文本名称'); if (!name) return; try { const path = `${(directory.value || '/').replace(/\/$/, '')}/${name}`; if (button.dataset.action === 'mkdir') await fileAPI.createDirectory(Number(root.value), path); else await fileAPI.createFile(Number(root.value), path); filesStatus.textContent = '操作成功。'; await renderFiles(); } catch (error) { filesStatus.textContent = friendlyError(error); } });
   const admin = document.querySelector('#admin-settings');
   const adminForm = document.querySelector('#admin-settings-form');
   const adminStatus = document.querySelector('#admin-settings-status');
