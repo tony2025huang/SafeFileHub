@@ -205,6 +205,36 @@ test('a failed file does not prevent other files or the summary from completing'
   assert.deepEqual(summary, { total: 3, completed: 2, failed: 1, cancelled: 0 });
 });
 
+test('failed items can be removed without resubmission or affecting other items', async () => {
+  const api = fakeAPI({ failPaths: ['bad.txt'] });
+  const batch = createUploadBatch([file('bad.txt', 'bad'), file('good.txt', 'good')], api, { rootID: 1, concurrency: 1 });
+  await batch.start();
+  const failed = batch.items[0];
+  assert.equal(failed.status, 'failed');
+  const creates = api.calls.create.length;
+  await batch.remove(failed);
+  assert.deepEqual(batch.items.map(item => item.path), ['/good.txt']);
+  assert.equal(failed.file, null);
+  assert.equal(failed.uploadID, '');
+  await batch.start();
+  assert.equal(api.calls.create.length, creates);
+  assert.equal(batch.items[0].status, 'completed');
+});
+
+test('retry resets a failed item before resubmitting it', async () => {
+  const api = fakeAPI({ failPaths: ['retry.txt'] });
+  const batch = createUploadBatch([file('retry.txt', 'retry')], api, { rootID: 1 });
+  await batch.start();
+  const item = batch.items[0];
+  assert.equal(item.status, 'failed');
+  const statuses = [];
+  item.error = 'old error';
+  api.complete = async id => { api.calls.complete.push(id); };
+  await batch.retry(item);
+  assert.equal(item.status, 'completed');
+  assert.equal(item.error, '');
+});
+
 test('special path characters round-trip unchanged through independent upload sessions', async () => {
   const api = fakeAPI();
   const names = ['a+b.txt', '100%.txt', 'what?.txt', 'two words.txt', '中文.txt', 'emoji-😀.txt'];

@@ -174,6 +174,7 @@ export function createUploadBatch(files, api, options) {
     status: 'queued',
     error: '',
     controller: null,
+    removed: false,
   }));
 
   function notify(item) { settings.onProgress(item); }
@@ -221,16 +222,21 @@ export function createUploadBatch(files, api, options) {
   function enqueue(item) {
     return new Promise(resolve => { queue.push({ item, resolve }); drain(); });
   }
+  let drainTimer = null;
   function drain() {
     if (draining) return;
     draining = true;
     const work = async () => {
       while (queue.length || active) {
         while (active < settings.concurrency && queue.length) {
-          const job = queue.shift(); active++;
+          const job = queue.shift();
+          if (job.item.removed) { job.resolve(); continue; }
+          active++;
           run(job.item).finally(() => { active--; job.resolve(); drain(); });
         }
-        if (active) await new Promise(resolve => setTimeout(resolve, 0));
+        if (active) await new Promise(resolve => {
+          drainTimer = setTimeout(() => { drainTimer = null; resolve(); }, 0);
+        });
       }
       draining = false;
     };
@@ -258,8 +264,30 @@ export function createUploadBatch(files, api, options) {
     if (item.uploadID) await api.cancel(item.uploadID);
   }
   async function retry(item) {
-    if (item.status !== 'failed') return;
+    if (item.status !== 'failed' || item.removed) return;
+    item.error = '';
+    item.status = 'queued';
+    notify(item);
     await enqueue(item);
+  }
+  async function remove(item) {
+    if (!item || item.removed || !['failed', 'cancelled'].includes(item.status)) return;
+    item.removed = true;
+    item.controller?.abort();
+    const uploadID = item.uploadID;
+    item.controller = null;
+    item.uploadID = '';
+    if (uploadID) await api.cancel(uploadID).catch(() => {});
+    const index = items.indexOf(item);
+    if (index >= 0) items.splice(index, 1);
+    for (let i = queue.length - 1; i >= 0; i--) {
+      if (queue[i].item === item) queue.splice(i, 1)[0].resolve();
+    }
+    item.file = null;
+    if (!active && !queue.length && drainTimer !== null) {
+      clearTimeout(drainTimer);
+      drainTimer = null;
+    }
   }
   function summary() {
     return items.reduce((result, item) => {
@@ -270,7 +298,7 @@ export function createUploadBatch(files, api, options) {
       return result;
     }, { total: 0, completed: 0, failed: 0, cancelled: 0 });
   }
-  return { items, start, pause, resume, cancel, retry, summary };
+  return { items, start, pause, resume, cancel, retry, remove, summary };
 }
 
 export function uploadAPI(fetchImpl = fetch) {
@@ -450,7 +478,7 @@ function mountUI() {
     info.append(title, details, progress, state); if (item.error) { const error = document.createElement('span'); error.className = 'error'; error.textContent = item.error; info.append(error); }
     row.append(info);
     if (!uploadStarted && item.status === 'queued') { const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'danger'; remove.textContent = '移除'; remove.onclick = () => { const index = queuedBatch.items.indexOf(item); if (index >= 0) queuedBatch.items.splice(index, 1); queuedFiles.splice(index, 1); renderQueue(queuedBatch); result.textContent = `${queuedBatch.items.length} 项待上传`; }; row.append(remove); }
-    for (const [label, action] of [['暂停', () => queuedBatch.pause(item)], ['取消', () => queuedBatch.cancel(item)], ['重试', () => queuedBatch.retry(item)]]) { if (item.status === 'queued' && !uploadStarted && label !== '取消') continue; const button = document.createElement('button'); button.type = 'button'; button.textContent = label; button.onclick = async () => { await action(); renderQueue(queuedBatch); }; row.append(' ', button); }
+    for (const [label, action] of [['暂停', () => queuedBatch.pause(item)], ['取消', () => queuedBatch.cancel(item)], ['重试', () => queuedBatch.retry(item)], ['移除', () => queuedBatch.remove(item)]]) { if (label === '移除' && !['failed', 'cancelled'].includes(item.status)) continue; if (item.status === 'queued' && !uploadStarted && label !== '取消') continue; const button = document.createElement('button'); button.type = 'button'; button.textContent = label; button.onclick = async () => { await action(); renderQueue(queuedBatch); }; row.append(' ', button); }
     return row;
   })); };
   const addSelectedFiles = files => {
