@@ -172,7 +172,7 @@ test('multiple files receive independent upload sessions', async () => {
   const batch = createUploadBatch([file('one.txt', 'one'), file('two.txt', 'two')], api, { rootID: 7 });
   const summary = await batch.start();
   assert.equal(api.calls.create.length, 2);
-  assert.deepEqual(api.calls.create.map(call => call.path), ['/one.txt', '/two.txt']);
+  assert.deepEqual(api.calls.create.map(call => call.path), ['one.txt', 'two.txt']);
   assert.notEqual(batch.items[0].uploadID, batch.items[1].uploadID);
   assert.deepEqual(summary, { total: 2, completed: 2, failed: 0, cancelled: 0 });
 });
@@ -183,6 +183,7 @@ test('directory selections retain webkitRelativePath and encode each logical seg
   const batch = createUploadBatch([selected], api, { rootID: 1, directory: '/incoming' });
   await batch.start();
   assert.equal(batch.items[0].path, '/incoming/photos/2026/报告 ?.txt');
+  assert.equal(api.calls.create[0].path, 'incoming/photos/2026/报告 ?.txt');
   assert.equal(encodeLogicalPath(batch.items[0].path), '/incoming/photos/2026/%E6%8A%A5%E5%91%8A%20%3F.txt');
 });
 
@@ -195,7 +196,7 @@ test('the default bounded pool never starts more than four files at once', async
 });
 
 test('a failed file does not prevent other files or the summary from completing', async () => {
-  const api = fakeAPI({ failPaths: ['/bad.txt'] });
+  const api = fakeAPI({ failPaths: ['bad.txt'] });
   const batch = createUploadBatch([file('good.txt', 'good'), file('bad.txt', 'bad'), file('later.txt', 'later')], api, { rootID: 1 });
   const summary = await batch.start();
   assert.equal(batch.items[0].status, 'completed');
@@ -209,7 +210,7 @@ test('special path characters round-trip unchanged through independent upload se
   const names = ['a+b.txt', '100%.txt', 'what?.txt', 'two words.txt', '中文.txt', 'emoji-😀.txt'];
   const batch = createUploadBatch(names.map(name => file(name, 'x')), api, { rootID: 3, directory: '/drop' });
   await batch.start();
-  assert.deepEqual(api.calls.create.map(call => call.path), names.map(name => `/drop/${name}`));
+  assert.deepEqual(api.calls.create.map(call => call.path), names.map(name => `drop/${name}`));
 });
 
 test('uploadAPI encodes every path segment in create JSON and IDs in request URLs', async () => {
@@ -232,7 +233,7 @@ test('the server accepts encoded JSON logical paths and preserves special names'
 });
 
 test('pause, cancel, retry, and HEAD-derived progress are available per file', async () => {
-  const api = fakeAPI({ failPaths: ['/retry.txt'], chunkSize: 2 });
+  const api = fakeAPI({ failPaths: ['retry.txt'], chunkSize: 2 });
   const batch = createUploadBatch([file('retry.txt', 'abcd'), file('cancel.txt', 'x')], api, { rootID: 1 });
   await batch.start();
   const item = batch.items[0];
@@ -264,7 +265,7 @@ test('resume reads a non-zero HEAD offset and reports it immediately', async () 
 
 test('retry shares the bounded pool and reports lifecycle progress', async () => {
   const events = [];
-  const api = fakeAPI({ failPaths: ['/retry.txt'], chunkSize: 2 });
+  const api = fakeAPI({ failPaths: ['retry.txt'], chunkSize: 2 });
   const batch = createUploadBatch([file('retry.txt', 'abcd'), file('other.txt', 'abcd')], api, { rootID: 1, concurrency: 1, onProgress: item => events.push([item.path, item.status, item.progress]) });
   await batch.start();
   api.complete = async id => { api.calls.complete.push(id); };

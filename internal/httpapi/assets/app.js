@@ -171,7 +171,7 @@ export function createUploadBatch(files, api, options) {
     item.error = '';
     try {
       if (!item.uploadID) {
-        const session = await api.create({ rootID: settings.rootID, path: item.path, size: item.file.size });
+        const session = await api.create({ rootID: settings.rootID, path: mutationPath(item.path), size: item.file.size });
         item.uploadID = session.uploadID;
         item.chunkSize = session.chunkSize;
         item.offset = session.offset;
