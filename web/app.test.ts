@@ -276,11 +276,13 @@ test('retry shares the bounded pool and reports lifecycle progress', async () =>
   assert.ok(events.some(([, status, progress]) => status === 'uploading' && progress > 0));
 });
 
-test('file API and MD5 formatter show only enabled safe digests', async () => {
+test('file API encodes one relative logical path and preserves Unicode and spaces', async () => {
   const calls = [];
   const api = filesAPI(async (url, init) => { calls.push({ url, init }); return { ok: true, json: async () => ({ files: [] }) }; });
-  await api.list(3, '/docs');
-  assert.equal(calls[0].url, '/roots/3/files?path=%2Fdocs');
+  await api.list(3, '/docs/中文 2026');
+  assert.equal(calls[0].url, '/roots/3/files?path=docs%2F%E4%B8%AD%E6%96%87+2026');
+  await api.list(3, '/');
+  assert.equal(calls[1].url, '/roots/3/files?path=%2F');
   assert.equal(calls[0].init.credentials, 'same-origin');
   assert.equal(formatMD5({ md5_status: 'ready', md5_digest: 'd41d8cd98f00b204e9800998ecf8427e' }, true), 'MD5: d41d8cd98f00b204e9800998ecf8427e');
   assert.equal(formatMD5({ md5_status: 'ready', md5_digest: 'unsafe' }, true), 'MD5: unavailable');

@@ -307,7 +307,12 @@ export function filesAPI(fetchImpl = fetch) {
   return {
     async list(rootID, path = '/') {
       if (!Number.isInteger(rootID) || rootID <= 0) throw new Error('a positive rootID is required');
-      return checked(await fetchImpl(`/roots/${rootID}/files?${logicalPathQuery(path)}`, { credentials: 'same-origin' })).then(response => response.json());
+      // The Go handler receives URL.Query after net/http decodes the query
+      // once, and accepts relative logical paths (with '/' reserved for root).
+      // Strip the UI-only leading slash before URLSearchParams performs the
+      // one wire encoding, otherwise /docs becomes an invalid decoded path.
+      const queryPath = path === '/' ? '/' : mutationPath(path);
+      return checked(await fetchImpl(`/roots/${rootID}/files?${logicalPathQuery(queryPath)}`, { credentials: 'same-origin' })).then(response => response.json());
     },
     async createDirectory(rootID, path) { await checked(await fetchImpl('/api/directories', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({root_id: rootID, path: mutationPath(path)}), credentials:'same-origin' })); },
     async createFile(rootID, path, content = '') { await checked(await fetchImpl('/api/files', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({root_id: rootID, path: mutationPath(path), content}), credentials:'same-origin' })); },
