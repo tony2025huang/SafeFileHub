@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -90,10 +89,8 @@ func createArchive(repo archiveRepository, auth archiveAuthorizer, manager *arch
 			return
 		}
 		if in.Path == "" { in.Path = "/" }
-		decodedWirePath, err := url.PathUnescape(in.Path)
-		if err != nil { http.Error(w, "invalid archive path", 400); return }
-		decodedPath := strings.TrimPrefix(decodedWirePath, "/")
-		if decodedWirePath == "/" {
+		decodedPath := strings.TrimPrefix(in.Path, "/")
+		if in.Path == "/" {
 			decodedPath = "/"
 		}
 		p, err := pathpolicy.ParseDecodedPath(decodedPath, policy)
@@ -116,6 +113,19 @@ func createArchive(repo archiveRepository, auth archiveAuthorizer, manager *arch
 			return
 		}
 		entries := make([]archive.Entry, 0)
+		requested := make(map[int64]struct{}, len(in.FileIDs))
+		for _, id := range in.FileIDs {
+			if id <= 0 {
+				http.Error(w, "invalid archive selection", http.StatusBadRequest)
+				return
+			}
+			if _, duplicate := requested[id]; duplicate {
+				http.Error(w, "invalid archive selection", http.StatusBadRequest)
+				return
+			}
+			requested[id] = struct{}{}
+		}
+		found := make(map[int64]struct{}, len(requested))
 		for _, f := range files {
 			selected := len(in.FileIDs) == 0 && (f.LogicalPath == p.Canonical || strings.HasPrefix(f.LogicalPath, strings.TrimSuffix(p.Canonical, "/")+"/"))
 			if len(in.FileIDs) > 0 {
@@ -123,8 +133,13 @@ func createArchive(repo archiveRepository, auth archiveAuthorizer, manager *arch
 			}
 			if selected {
 				if len(in.FileIDs) > 0 && f.RootID != rootID { continue }
+				if len(in.FileIDs) > 0 { found[f.ID] = struct{}{} }
 				entries = append(entries, archive.Entry{LogicalPath: f.LogicalPath, ObjectKey: f.ObjectKey, Size: f.Size})
 			}
+		}
+		if len(requested) > 0 && len(found) != len(requested) {
+			http.Error(w, "archive file not found", http.StatusNotFound)
+			return
 		}
 		started := time.Now()
 		job, err := manager.CreateForUser(r.Context(), uid, p.Canonical, entries, archiveHTTPAuthorizer{ctx: r.Context(), auth: auth, uid: uid, rootID: rootID})

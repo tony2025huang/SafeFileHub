@@ -213,7 +213,7 @@ test('special path characters round-trip unchanged through independent upload se
   assert.deepEqual(api.calls.create.map(call => call.path), names.map(name => `drop/${name}`));
 });
 
-test('uploadAPI encodes every path segment in create JSON and IDs in request URLs', async () => {
+test('uploadAPI sends raw JSON paths and encodes IDs in request URLs', async () => {
   const requests = [];
   const api = (await import('./app.ts')).uploadAPI(async (url, init = {}) => {
     requests.push({ url, init });
@@ -222,7 +222,7 @@ test('uploadAPI encodes every path segment in create JSON and IDs in request URL
   });
   await api.create({ rootID: 1, path: 'drop/a+b/%? 空/中文😀.txt', size: 1 });
   await api.offset('id /?');
-  assert.equal(JSON.parse(requests[0].init.body).path, 'drop/a%2Bb/%25%3F%20%E7%A9%BA/%E4%B8%AD%E6%96%87%F0%9F%98%80.txt');
+  assert.equal(JSON.parse(requests[0].init.body).path, 'drop/a+b/%? 空/中文😀.txt');
   assert.equal(requests[1].url, '/api/uploads/id%20%2F%3F');
 });
 
@@ -280,7 +280,7 @@ test('file API and MD5 formatter show only enabled safe digests', async () => {
   const calls = [];
   const api = filesAPI(async (url, init) => { calls.push({ url, init }); return { ok: true, json: async () => ({ files: [] }) }; });
   await api.list(3, '/docs');
-  assert.equal(calls[0].url, '/roots/3/files?path=/docs');
+  assert.equal(calls[0].url, '/roots/3/files?path=%2Fdocs');
   assert.equal(calls[0].init.credentials, 'same-origin');
   assert.equal(formatMD5({ md5_status: 'ready', md5_digest: 'd41d8cd98f00b204e9800998ecf8427e' }, true), 'MD5: d41d8cd98f00b204e9800998ecf8427e');
   assert.equal(formatMD5({ md5_status: 'ready', md5_digest: 'unsafe' }, true), 'MD5: unavailable');

@@ -13,7 +13,6 @@ import (
 	"github.com/example/safefilehub/internal/storage"
 	"github.com/example/safefilehub/internal/upload"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -109,12 +108,10 @@ func createUpload(m *upload.Manager, repo uploadRepository, a uploadAuthorizer, 
 			http.Error(w, "invalid upload", http.StatusBadRequest)
 			return
 		}
-		decodedPath, err := url.PathUnescape(in.Path)
-		if err != nil {
-			http.Error(w, "invalid path", http.StatusBadRequest)
-			return
-		}
-		p, err := pathpolicy.ParseDecodedPath(decodedPath, cfg.NamePolicy)
+		// JSON carries the logical path as raw UTF-8. Unlike a query value,
+		// encoding/json does not perform URL decoding, so unescaping here would
+		// corrupt literal percent-containing filenames (and double-decode input).
+		p, err := pathpolicy.ParseDecodedPath(in.Path, cfg.NamePolicy)
 		if err != nil {
 			http.Error(w, "invalid path", 400)
 			return

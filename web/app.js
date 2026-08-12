@@ -139,6 +139,12 @@ export function encodeLogicalPath(path) {
   return path.split('/').map(segment => encodeURIComponent(segment)).join('/');
 }
 
+// JSON carries raw UTF-8. Query strings are passed through URLSearchParams so
+// fetch performs the single standard query encoding at the wire boundary.
+export function logicalPathQuery(path) {
+  return new URLSearchParams({ path }).toString();
+}
+
 // File mutations use relative logical paths; the list endpoint alone reserves
 // '/' as its root-directory query value. Keep the canonical UI path separate
 // from this wire representation so paths are never double-decoded.
@@ -275,7 +281,7 @@ export function uploadAPI(fetchImpl = fetch) {
   return {
     async create(input) {
       const response = await checked(await fetchImpl('/api/uploads', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...input, path: encodeLogicalPath(mutationPath(input.path)) }), credentials: 'same-origin',
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...input, path: mutationPath(input.path) }), credentials: 'same-origin',
       }));
       const value = await response.json();
       return { uploadID: value.upload_id, chunkSize: value.chunk_size, offset: value.offset };
@@ -301,15 +307,15 @@ export function filesAPI(fetchImpl = fetch) {
   return {
     async list(rootID, path = '/') {
       if (!Number.isInteger(rootID) || rootID <= 0) throw new Error('a positive rootID is required');
-      return checked(await fetchImpl(`/roots/${rootID}/files?path=${encodeLogicalPath(path)}`, { credentials: 'same-origin' })).then(response => response.json());
+      return checked(await fetchImpl(`/roots/${rootID}/files?${logicalPathQuery(path)}`, { credentials: 'same-origin' })).then(response => response.json());
     },
-    async createDirectory(rootID, path) { await checked(await fetchImpl('/api/directories', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({root_id: rootID, path: encodeLogicalPath(mutationPath(path))}), credentials:'same-origin' })); },
-    async createFile(rootID, path, content = '') { await checked(await fetchImpl('/api/files', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({root_id: rootID, path: encodeLogicalPath(mutationPath(path)), content}), credentials:'same-origin' })); },
-    async renameFile(fileID, path) { await checked(await fetchImpl(`/api/files/${encodeURIComponent(fileID)}`, { method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path: encodeLogicalPath(mutationPath(path))}), credentials:'same-origin' })); },
+    async createDirectory(rootID, path) { await checked(await fetchImpl('/api/directories', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({root_id: rootID, path: mutationPath(path)}), credentials:'same-origin' })); },
+    async createFile(rootID, path, content = '') { await checked(await fetchImpl('/api/files', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({root_id: rootID, path: mutationPath(path), content}), credentials:'same-origin' })); },
+    async renameFile(fileID, path) { await checked(await fetchImpl(`/api/files/${encodeURIComponent(fileID)}`, { method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path: mutationPath(path)}), credentials:'same-origin' })); },
     async deleteFile(fileID) { await checked(await fetchImpl(`/api/files/${encodeURIComponent(fileID)}`, { method: 'DELETE', credentials: 'same-origin' })); },
     async deleteDirectory(directoryID) { await checked(await fetchImpl(`/api/directories/${encodeURIComponent(directoryID)}`, { method: 'DELETE', credentials: 'same-origin' })); },
     async archive(rootID, path, fileIDs = []) {
-      const body = fileIDs.length ? { file_ids: fileIDs } : { path: encodeLogicalPath(path) };
+      const body = fileIDs.length ? { file_ids: fileIDs } : { path: mutationPath(path) };
       const response = await checked(await fetchImpl(`/api/roots/${rootID}/archives`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body), credentials:'same-origin' }));
       return response.json();
     },

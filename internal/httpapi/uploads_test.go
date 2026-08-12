@@ -108,7 +108,7 @@ func TestCreateUploadDecodesBrowserEscapedLogicalPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body := `{"root_id":1,"path":"drop/a%2Bb/%25%3F%20%E7%A9%BA/%E4%B8%AD%E6%96%87%F0%9F%98%80.txt","size":1}`
+	body := `{"root_id":1,"path":"drop/a+b/%? 空/中文😀.txt","size":1}`
 	req := httptest.NewRequest(http.MethodPost, "/api/uploads", bytes.NewBufferString(body))
 	req.AddCookie(&http.Cookie{Name: sessions.CookieName(), Value: sid})
 	rr := httptest.NewRecorder()
