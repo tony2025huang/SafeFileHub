@@ -44,6 +44,13 @@ test('upload controls keep file and directory pickers separate and bind the righ
   assert.match(source, /selectedInput = directories; directories\.click\(\)/);
 });
 
+test('file UI hides technical root and directory inputs while keeping the current directory target', async () => {
+  const html = await readFile(new URL('./index.html', import.meta.url), 'utf8');
+  assert.doesNotMatch(html, /存储根 ID|目标目录|id="root-id"|id="directory"/);
+  assert.match(html, /id="breadcrumb"/);
+  assert.match(html, /id="upload-target"/);
+});
+
 test('deployment HTML loads the browser-ready JavaScript entrypoint', async () => {
   const [html, browserEntry, source] = await Promise.all([
     readFile(new URL('./index.html', import.meta.url), 'utf8'),

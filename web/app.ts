@@ -286,8 +286,10 @@ function mountUI() {
   const form = document.querySelector('#upload-form');
   const input = document.querySelector('#files');
   const directories = document.querySelector('#directories');
-  const directory = document.querySelector('#directory');
-  const root = document.querySelector('#root-id');
+  // The product has one system-managed primary root. Keep its API identifier
+  // internal; users choose only the current logical directory.
+  const root = { value: '1' };
+  const directory = { value: '/' };
   const list = document.querySelector('#uploads');
   const result = document.querySelector('#summary');
   const fileList = document.querySelector('#file-list');
@@ -296,7 +298,7 @@ function mountUI() {
   const fileSearch = document.querySelector('#file-search');
   const breadcrumb = document.querySelector('#breadcrumb');
   const fileActions = document.querySelector('#file-actions');
-  if (!form || !input || !directories || !directory || !root || !list || !result) return;
+  if (!form || !input || !directories || !list || !result) return;
   let selectedInput = input;
   const settingsView = document.querySelector('[data-view="settings"]');
   const filesView = document.querySelector('[data-view="files"]');
@@ -358,6 +360,8 @@ function mountUI() {
         row.append(name, meta, actions); return row;
       }));
       filesStatus.textContent = files.length ? `${files.length} 项` : (query ? '没有匹配的文件。' : '当前目录为空。');
+      const uploadTarget = document.querySelector('#upload-target');
+      if (uploadTarget) uploadTarget.textContent = directory.value || '/';
       if (breadcrumb) { breadcrumb.replaceChildren(); const parts = (directory.value || '/').split('/').filter(Boolean); const rootLink = document.createElement('button'); rootLink.className='link-button'; rootLink.textContent='/'; rootLink.onclick=()=>{directory.value='/'; void renderFiles();}; breadcrumb.append(rootLink); let path='/'; parts.forEach(part=>{ path += `${part}/`; const link=document.createElement('button'); link.className='link-button'; link.textContent=` ${part} /`; const target=path.replace(/\/$/,''); link.onclick=()=>{directory.value=target; void renderFiles();}; breadcrumb.append(link); }); }
     } catch (error) { fileList.replaceChildren(); filesStatus.textContent = friendlyError(error); }
   };

@@ -165,6 +165,9 @@ func runWithLifecycle(lifecycle context.Context, args []string, cfg config.Confi
 	if credentials.Created {
 		log.Printf("SafeFileHub initial administrator created: username=%s password=%s", credentials.Username, credentials.Password)
 	}
+	if err := ensurePrimaryStorageRoot(lifecycle, repo, cfg.StorageRoot); err != nil {
+		return err
+	}
 
 	sessions := auth.NewSessionManager(auth.NewMemorySessionStore(), auth.SessionConfig{LifecycleContext: lifecycle})
 	defer sessions.Close()
@@ -248,6 +251,20 @@ func runWithLifecycle(lifecycle context.Context, args []string, cfg config.Confi
 	server := httpapi.ServerTimeouts(cfg, h)
 	log.Printf("SafeFileHub listening on %s", cfg.ListenAddr)
 	return serveWithLifecycle(lifecycle, cfg.ShutdownTimeout, server, server.ListenAndServe)
+}
+
+// ensurePrimaryStorageRoot keeps the single product root internal to startup.
+// The browser never needs to discover or edit this technical identifier.
+func ensurePrimaryStorageRoot(ctx context.Context, repo *db.Repository, path string) error {
+	if _, err := repo.StorageRootByID(ctx, 1); err == nil {
+		return nil
+	} else if err != db.ErrNotFound {
+		return fmt.Errorf("check primary storage root: %w", err)
+	}
+	if _, err := repo.CreateStorageRoot(ctx, db.StorageRoot{Name: "primary", Path: path}); err != nil {
+		return fmt.Errorf("create primary storage root: %w", err)
+	}
+	return nil
 }
 
 type checksumObjectStore struct{ store *storage.ObjectStore }

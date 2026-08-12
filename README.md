@@ -22,7 +22,7 @@ SafeFileHub 是面向内部或受控环境的 Go 安全文件服务，提供认�
 - `DELETE /api/uploads/{id}`：**只取消未完成**的 upload session，不删除已发布文件。
 - `POST /api/roots/{rootID}/archives`、`GET|DELETE /api/archives/{jobID}`，以及 `/api/admin/*`。
 
-公开路由（无需登录即可访问）包括 `GET /`、`GET /index.html`、`GET /login`、`GET /login.html`、`GET /app.js`、`GET /healthz`、`GET /readyz`、`GET /metrics`、`GET /api/site-settings`、`GET /assets/site/{assetID}` 和 `GET /favicon.ico`（没有对应品牌资源时可能返回 `404`）。登录页是内嵌的自包含页面；`POST /login` 用于建立 session。文件、上传、归档和管理 API 仍需认证与相应权限。
+公开路由（无需登录即可访问）包括 `GET /`、`GET /index.html`、`GET /login`、`GET /login.html`、`GET /app.js`、`GET /healthz`、`GET /readyz`、`GET /metrics`、`GET /api/site-settings`、`GET /assets/site/{assetID}` 和 `GET /favicon.ico`（没有对应品牌资源时可能返回 `404`）。登录页是内嵌的自包含页面；`POST /login` 用于建立 session。文件、上传、归档和管理 API 仍需认证与相应权限。Web 界面不展示 `root_id` 或宿主目录字段：当前“我的文件”目录/面包屑就是上传目标；在当前没有根列表/当前根 API 的实现中，前端使用系统初始化的主存储根（内部 ID 1），根由服务端和权限策略管理。API 语义不变。
 
 创建和删除均需对应逻辑路径的权限；路径校验拒绝 traversal、double encoding、反斜杠、NUL/control character、Windows 保留名、危险前缀和符号链接逃逸。具体字段和响应以 `internal/httpapi` 的实现与测试为准。
 
