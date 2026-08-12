@@ -542,6 +542,22 @@ func (r *Repository) FileByRootAndPath(ctx context.Context, rootID int64, logica
 	return file, nil
 }
 
+// RenameFile atomically changes the logical name while retaining the object key.
+func (r *Repository) RenameFile(ctx context.Context, id int64, oldPath, newPath string) error {
+	result, err := r.db.ExecContext(ctx, `UPDATE files SET logical_path=?, updated_at=? WHERE id=? AND logical_path=? AND delete_state='active'`, newPath, unixNano(time.Now().UTC()), id, oldPath)
+	if err != nil {
+		return classifyError(err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // BeginFileDelete tombstones the exact id/key pair before object deletion.
 func (r *Repository) BeginFileDelete(ctx context.Context, id int64, key string) error {
 	result, err := r.db.ExecContext(ctx, `UPDATE files SET delete_state='deleting', updated_at=? WHERE id=? AND object_key=? AND delete_state='active'`, unixNano(time.Now().UTC()), id, key)

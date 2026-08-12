@@ -15,8 +15,9 @@ SafeFileHub 是面向内部或受控环境的 Go 安全文件服务，提供认�
 - `POST /login`、`POST /logout`、`GET /session`
 - `GET /roots/{rootID}/files`
 - `POST /api/uploads`、`HEAD|PATCH|DELETE /api/uploads/{id}`、`POST /api/uploads/{id}/complete`
-- `POST /api/files`：创建已发布的零字节文件。JSON：`{"root_id":1,"path":"reports/empty.txt"}`。
+- `POST /api/files`：创建已发布文件。JSON：`{"root_id":1,"path":"reports/note.txt","content":"UTF-8 文本"}`；`content` 可选，最大 16 MiB，服务端真实写入并持久化。
 - `POST /api/directories`：创建显式目录。JSON：`{"root_id":1,"path":"reports"}`。
+- `PATCH /api/files/{fileID}`：重命名已发布文件。JSON：`{"path":"reports/renamed.txt"}`。仅支持文件，不支持目录重命名；需同时具备原路径和目标路径的 write 权限，目标冲突返回 `409`。
 - `DELETE /api/files/{fileID}`：删除已发布文件。
 - `DELETE /api/directories/{directoryID}`：仅非递归删除；含已发布文件或显式子目录时返回 `409`。
 - `DELETE /api/uploads/{id}`：**只取消未完成**的 upload session，不删除已发布文件。

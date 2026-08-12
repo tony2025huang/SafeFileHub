@@ -137,6 +137,31 @@ func (s *ObjectStore) CreateEmpty(logicalPath string) (key string, err error) {
 	return key, nil
 }
 
+// CreateContent creates and durably publishes a small complete object.
+func (s *ObjectStore) CreateContent(logicalPath string, content []byte) (key string, err error) {
+	key, writer, err := s.Create(logicalPath)
+	if err != nil {
+		return "", err
+	}
+	f, ok := writer.(*os.File)
+	if !ok {
+		_ = writer.Close()
+		_ = s.Remove(key)
+		return "", fmt.Errorf("created object is not a file")
+	}
+	if _, err = f.Write(content); err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		_ = s.Remove(key)
+		return "", fmt.Errorf("write object: %w", err)
+	}
+	return key, nil
+}
+
 // Open opens only a validated opaque object key below the physical root.
 func (s *ObjectStore) Open(key string) (*os.File, error) {
 	rootFD, err := s.rootFD()

@@ -102,6 +102,7 @@ export function friendlyError(error) {
   if (status === 401) return '登录已过期，请重新登录。';
   if (status === 403) return '你没有执行此操作的权限。';
   if (status === 400) return '请求无法处理，请检查文件名或路径后重试。';
+  if (status === 413) return '内容超过大小限制。';
   if (status === 409) return '文件状态已变化，请刷新后重试。';
   if (status === 429) return '操作太频繁，请稍后再试。';
   if (status >= 500) return '服务暂时不可用，请稍后再试。';
@@ -303,7 +304,8 @@ export function filesAPI(fetchImpl = fetch) {
       return checked(await fetchImpl(`/roots/${rootID}/files?path=${encodeLogicalPath(path)}`, { credentials: 'same-origin' })).then(response => response.json());
     },
     async createDirectory(rootID, path) { await checked(await fetchImpl('/api/directories', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({root_id: rootID, path: encodeLogicalPath(mutationPath(path))}), credentials:'same-origin' })); },
-    async createFile(rootID, path) { await checked(await fetchImpl('/api/files', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({root_id: rootID, path: encodeLogicalPath(mutationPath(path))}), credentials:'same-origin' })); },
+    async createFile(rootID, path, content = '') { await checked(await fetchImpl('/api/files', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({root_id: rootID, path: encodeLogicalPath(mutationPath(path)), content}), credentials:'same-origin' })); },
+    async renameFile(fileID, path) { await checked(await fetchImpl(`/api/files/${encodeURIComponent(fileID)}`, { method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path: encodeLogicalPath(mutationPath(path))}), credentials:'same-origin' })); },
     async deleteFile(fileID) { await checked(await fetchImpl(`/api/files/${encodeURIComponent(fileID)}`, { method: 'DELETE', credentials: 'same-origin' })); },
     async deleteDirectory(directoryID) { await checked(await fetchImpl(`/api/directories/${encodeURIComponent(directoryID)}`, { method: 'DELETE', credentials: 'same-origin' })); },
     async archive(rootID, path) {
@@ -478,6 +480,7 @@ function mountUI() {
         meta.textContent = file.is_directory ? '文件夹' : `${formatFileSize(file.size)} · ${formatModified(file.updated_at || file.modified_at)}${formatMD5(file, publicSettings.md5_enabled) ? ` · ${formatMD5(file, publicSettings.md5_enabled)}` : ''}`;
         const actions = document.createElement('span'); actions.className = 'actions';
         if (!file.is_directory && file.id) { const download = document.createElement('a'); download.href = fileAPI.downloadURL(file.id); download.textContent = '下载'; download.className = 'button secondary'; download.setAttribute('download',''); actions.append(download); }
+        if (!file.is_directory && file.id) { const rename = document.createElement('button'); rename.type='button'; rename.textContent='重命名'; rename.onclick=async()=>{ const name=prompt('新文件名（仅支持文件）',file.name || ''); if(!name?.trim())return; try { await fileAPI.renameFile(file.id,joinPath(directory.value||'/',name.trim())); filesStatus.textContent='文件已重命名。'; await renderFiles(); } catch(error) { filesStatus.textContent=friendlyError(error); } }; actions.append(rename); }
         if (file.id) { const remove = document.createElement('button'); remove.type='button'; remove.textContent='删除'; remove.className='danger'; remove.onclick = async () => { if (!confirm(`确认删除“${file.name || file.path}”？此操作不可撤销。`)) return; remove.disabled=true; try { if (file.is_directory) await fileAPI.deleteDirectory(file.id); else await fileAPI.deleteFile(file.id); filesStatus.textContent='操作成功。'; await renderFiles(); } catch(error) { remove.disabled=false; filesStatus.textContent=friendlyError(error); } }; actions.append(remove); }
         row.append(name, meta, actions); return row;
       }));
@@ -494,9 +497,9 @@ function mountUI() {
   if (uploadDir) uploadDir.addEventListener('click', () => { selectedInput = directories; directories.click(); });
   if (fileSearch) fileSearch.addEventListener('input', () => { void renderFiles(); });
   if (fileActions) fileActions.addEventListener('click', async event => { const button = event.target.closest('button[data-action]'); if (!button || !['mkdir', 'text', 'archive'].includes(button.dataset.action)) return; if (button.dataset.action === 'archive') { try { const job=await fileAPI.archive(Number(root.value), directory.value || '/'); filesStatus.textContent=`归档任务已创建：${job.id || '处理中'}`; } catch(error) { filesStatus.textContent=friendlyError(error); } return; }
-    const name = prompt(button.dataset.action === 'mkdir' ? '新建目录名称' : '新建文本名称（仅创建空文件）'); if (!name?.trim()) return;
+    const name = prompt(button.dataset.action === 'mkdir' ? '新建目录名称' : '新建文本名称'); if (!name?.trim()) return;
     const path = joinPath(directory.value || '/', name.trim());
-    try { if (button.dataset.action === 'text') { const content = prompt('文本内容（后端当前仅支持创建空文件，内容不会保存）', ''); await fileAPI.createFile(Number(root.value), path); filesStatus.textContent = content ? '文本文件已创建，但后端不支持保存内容，内容未写入。' : '空文本文件已创建。'; } else { await fileAPI.createDirectory(Number(root.value), path); filesStatus.textContent = '目录已创建。'; } await renderFiles(); } catch (error) { filesStatus.textContent = friendlyError(error); }
+    try { if (button.dataset.action === 'text') { const content = prompt('文本内容（UTF-8，最大 16 MiB）', ''); if (content === null) return; await fileAPI.createFile(Number(root.value), path, content); filesStatus.textContent = '文本文件已创建并写入内容。'; } else { await fileAPI.createDirectory(Number(root.value), path); filesStatus.textContent = '目录已创建。'; } await renderFiles(); } catch (error) { filesStatus.textContent = friendlyError(error); }
   });
   const admin = document.querySelector('#admin-settings');
   const adminForm = document.querySelector('#admin-settings-form');

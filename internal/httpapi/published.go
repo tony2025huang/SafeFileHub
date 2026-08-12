@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"path"
 	"strconv"
+	"unicode/utf8"
 
 	"github.com/example/safefilehub/internal/config"
 	"github.com/example/safefilehub/internal/db"
@@ -47,9 +48,17 @@ type publishedRepository interface {
 	DirectoryEmpty(context.Context, db.Directory) (bool, error)
 	DeleteDirectory(context.Context, int64) error
 }
+type fileRenameRepository interface {
+	RenameFile(context.Context, int64, string, string) error
+}
 type directoryRequest struct {
 	RootID int64  `json:"root_id"`
 	Path   string `json:"path"`
+}
+type fileCreateRequest struct {
+	RootID  int64  `json:"root_id"`
+	Path    string `json:"path"`
+	Content string `json:"content"`
 }
 type directoryResponse struct {
 	ID     int64  `json:"id"`
@@ -68,6 +77,10 @@ type fileResponse struct {
 // metadata. If metadata cannot be inserted, it removes that object, so no
 // failed request leaves a reachable object or a partial files row.
 func createEmptyFile(repo publishedRepository, a fileAuthorizer, policy config.NamePolicy, store *storage.ObjectStore) http.HandlerFunc {
+	return createFile(repo, a, policy, store, false)
+}
+
+func createFile(repo publishedRepository, a fileAuthorizer, policy config.NamePolicy, store *storage.ObjectStore, withContent bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		rw := &auditRecorder{ResponseWriter: w}
 		w = rw
@@ -81,10 +94,10 @@ func createEmptyFile(repo publishedRepository, a fileAuthorizer, policy config.N
 			}
 			auditPublished(repo, r, "file.create", auditUser, auditRoot, auditPath, status)
 		}()
-		var in directoryRequest
-		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+		var in fileCreateRequest
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<20))
 		decoder.DisallowUnknownFields()
-		if decoder.Decode(&in) != nil || in.RootID <= 0 {
+		if decoder.Decode(&in) != nil || in.RootID <= 0 || (!withContent && in.Content != "") || !utf8.ValidString(in.Content) {
 			http.Error(w, "invalid file", http.StatusBadRequest)
 			return
 		}
@@ -134,7 +147,11 @@ func createEmptyFile(repo publishedRepository, a fileAuthorizer, policy config.N
 			http.Error(w, "check destination", 500)
 			return
 		}
-		key, err := store.CreateEmpty(p.Canonical)
+		if len(in.Content) > 16<<20 {
+			http.Error(w, "content too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		key, err := store.CreateContent(p.Canonical, []byte(in.Content))
 		if err != nil {
 			http.Error(w, "create object", 500)
 			return
@@ -163,6 +180,96 @@ func createEmptyFile(repo publishedRepository, a fileAuthorizer, policy config.N
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(201)
 		_ = json.NewEncoder(w).Encode(fileResponse{ID: out.ID, RootID: out.RootID, Path: out.LogicalPath, Size: out.Size})
+	}
+}
+
+func renameFile(repo publishedRepository, a fileAuthorizer, policy config.NamePolicy) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		rw := &auditRecorder{ResponseWriter: w}
+		w = rw
+		var f db.File
+		id, err := strconv.ParseInt(r.PathValue("fileID"), 10, 64)
+		if err != nil || id <= 0 {
+			http.Error(w, "invalid file", 400)
+			return
+		}
+		f, err = repo.FileByID(r.Context(), id)
+		if err != nil {
+			if errors.Is(err, db.ErrNotFound) {
+				http.Error(w, "not found", 404)
+			} else {
+				http.Error(w, "load file", 500)
+			}
+			return
+		}
+		uid, ok := r.Context().Value(sessionUserIDKey{}).(int64)
+		if !ok || uid <= 0 {
+			http.Error(w, "unauthorized", 401)
+			return
+		}
+		var in struct {
+			Path string `json:"path"`
+		}
+		d := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+		d.DisallowUnknownFields()
+		if d.Decode(&in) != nil {
+			http.Error(w, "invalid rename", 400)
+			return
+		}
+		p, err := pathpolicy.ParseDecodedPath(in.Path, policy)
+		if err != nil || p.Canonical == "/" {
+			http.Error(w, "invalid path", 400)
+			return
+		}
+		if ok, err := a.Authorize(r.Context(), uid, f.RootID, f.LogicalPath, "write"); err != nil || !ok {
+			if err != nil {
+				http.Error(w, "authorize rename", 500)
+			} else {
+				http.Error(w, "forbidden", 403)
+			}
+			return
+		}
+		if ok, err := a.Authorize(r.Context(), uid, f.RootID, p.Canonical, "write"); err != nil || !ok {
+			if err != nil {
+				http.Error(w, "authorize rename", 500)
+			} else {
+				http.Error(w, "forbidden", 403)
+			}
+			return
+		}
+		if _, err = repo.FileByRootAndPath(r.Context(), f.RootID, p.Canonical); err == nil {
+			http.Error(w, "destination exists", 409)
+			return
+		} else if !errors.Is(err, db.ErrNotFound) {
+			http.Error(w, "check destination", 500)
+			return
+		}
+		if parent := path.Dir(p.Canonical); parent != "/" {
+			if _, err = repo.DirectoryByRootAndPath(r.Context(), f.RootID, parent); err != nil {
+				if errors.Is(err, db.ErrNotFound) {
+					http.Error(w, "parent directory not found", 404)
+				} else {
+					http.Error(w, "load parent directory", 500)
+				}
+				return
+			}
+		}
+		rr, ok := repo.(fileRenameRepository)
+		if !ok {
+			http.Error(w, "rename unavailable", 500)
+			return
+		}
+		if err = rr.RenameFile(r.Context(), id, f.LogicalPath, p.Canonical); err != nil {
+			if errors.Is(err, db.ErrConflict) {
+				http.Error(w, "destination exists", 409)
+			} else {
+				http.Error(w, "rename file", 409)
+			}
+			return
+		}
+		auditPublished(repo, r, "file.rename", uid, f.RootID, p.Canonical, rw.status)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(fileResponse{ID: f.ID, RootID: f.RootID, Path: p.Canonical, Size: f.Size})
 	}
 }
 
