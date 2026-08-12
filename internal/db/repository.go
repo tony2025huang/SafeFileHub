@@ -674,6 +674,24 @@ func (r *Repository) DirectoryByID(ctx context.Context, id int64) (Directory, er
 	d.CreatedAt, d.UpdatedAt = fromUnixNano(created), fromUnixNano(updated)
 	return d, nil
 }
+func (r *Repository) DirectoriesUnderRoot(ctx context.Context, rootID int64) ([]Directory, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT id, root_id, logical_path, created_by_user_id, created_at, updated_at FROM directories WHERE root_id=? ORDER BY logical_path`, rootID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Directory
+	for rows.Next() {
+		var d Directory
+		var c, u int64
+		if err := rows.Scan(&d.ID, &d.RootID, &d.LogicalPath, &d.CreatedByUserID, &c, &u); err != nil {
+			return nil, err
+		}
+		d.CreatedAt, d.UpdatedAt = fromUnixNano(c), fromUnixNano(u)
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
 func (r *Repository) DirectoryEmpty(ctx context.Context, d Directory) (bool, error) {
 	prefix := d.LogicalPath + "/"
 	var exists bool

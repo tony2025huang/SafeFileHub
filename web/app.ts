@@ -109,6 +109,14 @@ export function friendlyError(error) {
   return '操作失败，请稍后再试。';
 }
 
+function serverReason(error) {
+  const reason = String(error?.reason || '').toLowerCase();
+  if (reason.includes('destination exists')) return '目标已存在（409），请改名后重试。';
+  if (reason.includes('parent directory not found')) return '父目录不存在，请刷新后重试。';
+  if (reason.includes('offset conflict')) return '上传偏移已变化，请重试。';
+  return '';
+}
+
 export function selectView(name, doc = document, win = typeof window !== 'undefined' ? window : undefined) {
   const view = name === 'settings' ? 'settings' : 'files';
   for (const section of doc.querySelectorAll('[data-view]')) section.hidden = section.dataset.view !== view;
@@ -195,7 +203,7 @@ export function createUploadBatch(files, api, options) {
     } catch (error) {
       item.controller = null;
       if (item.status === 'paused' || item.status === 'cancelled') return;
-      item.error = friendlyError(error);
+      item.error = serverReason(error) || friendlyError(error);
       setStatus(item, 'failed');
     }
   }
@@ -288,7 +296,7 @@ export function uploadAPI(fetchImpl = fetch) {
 }
 
 export function filesAPI(fetchImpl = fetch) {
-  async function checked(response) { if (!response.ok) { const error = new Error('request failed'); error.status = response.status; throw error; } return response; }
+  async function checked(response) { if (!response.ok) { const error = new Error('request failed'); error.status = response.status; try { error.reason = (await response.text()).slice(0, 160); } catch (_) {} throw error; } return response; }
   return {
     async list(rootID, path = '/') {
       if (!Number.isInteger(rootID) || rootID <= 0) throw new Error('a positive rootID is required');
@@ -445,8 +453,8 @@ function mountUI() {
     if (uploadStarted) return;
     uploadStarted = true; renderQueue(queuedBatch);
     const summary = await queuedBatch.start(); renderQueue(queuedBatch);
-    result.textContent = `${summary.completed}/${summary.total} completed; ${summary.failed} failed; ${summary.cancelled} cancelled`;
-    void renderFiles();
+    result.textContent = `上传完成：${summary.completed}/${summary.total}；失败 ${summary.failed}；已取消 ${summary.cancelled}`;
+    await renderFiles();
   });
 
   const api = siteSettingsAPI(session.fetch);
@@ -484,7 +492,7 @@ function mountUI() {
   const uploadDir = document.querySelector('[data-action="upload-dir"]');
   if (uploadFile) uploadFile.addEventListener('click', () => { selectedInput = input; input.click(); });
   if (uploadDir) uploadDir.addEventListener('click', () => { selectedInput = directories; directories.click(); });
-  if (fileSearch) fileSearch.addEventListener('input', () => { const query = fileSearch.value.trim().toLowerCase(); const filtered = listedFiles.filter(file => !query || `${file.name} ${file.path}`.toLowerCase().includes(query)); fileList?.replaceChildren(...filtered.map(file => { const row=document.createElement('li'); row.className='file-row'; row.textContent=`${file.is_directory ? '📁' : '📄'} ${file.name || file.path} · ${file.is_directory ? '文件夹' : `${file.size ?? 0} bytes`}`; return row; })); filesStatus.textContent = filtered.length ? `${filtered.length} 项` : (query ? '没有匹配的文件。' : '当前目录为空。'); });
+  if (fileSearch) fileSearch.addEventListener('input', () => { void renderFiles(); });
   if (fileActions) fileActions.addEventListener('click', async event => { const button = event.target.closest('button[data-action]'); if (!button || !['mkdir', 'text', 'archive'].includes(button.dataset.action)) return; if (button.dataset.action === 'archive') { try { const job=await fileAPI.archive(Number(root.value), directory.value || '/'); filesStatus.textContent=`归档任务已创建：${job.id || '处理中'}`; } catch(error) { filesStatus.textContent=friendlyError(error); } return; }
     const name = prompt(button.dataset.action === 'mkdir' ? '新建目录名称' : '新建文本名称（仅创建空文件）'); if (!name?.trim()) return;
     const path = joinPath(directory.value || '/', name.trim());

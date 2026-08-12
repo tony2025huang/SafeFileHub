@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/example/safefilehub/internal/config"
 	"github.com/example/safefilehub/internal/db"
@@ -18,6 +19,9 @@ type fileRepository interface {
 	StorageRootByID(context.Context, int64) (db.StorageRoot, error)
 	FilesUnderRoot(context.Context, int64) ([]db.File, error)
 }
+type directoryListRepository interface {
+	DirectoriesUnderRoot(context.Context, int64) ([]db.Directory, error)
+}
 type fileAuthorizer interface {
 	Authorize(context.Context, int64, int64, string, string) (bool, error)
 }
@@ -27,11 +31,14 @@ type fileListResponse struct {
 	Files []fileListEntry `json:"files"`
 }
 type fileListEntry struct {
-	Name      string `json:"name"`
-	Path      string `json:"path"`
-	Size      int64  `json:"size"`
-	MD5Status string `json:"md5_status"`
-	MD5Digest string `json:"md5_digest"`
+	Name        string    `json:"name"`
+	Path        string    `json:"path"`
+	Size        int64     `json:"size"`
+	MD5Status   string    `json:"md5_status"`
+	MD5Digest   string    `json:"md5_digest"`
+	IsDirectory bool      `json:"is_directory"`
+	ID          int64     `json:"id"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // NewServerWithFiles adds the Task 5 authenticated logical directory listing.
@@ -90,6 +97,14 @@ func listFiles(repository fileRepository, authorizer fileAuthorizer, policy conf
 			http.Error(w, "list files", http.StatusInternalServerError)
 			return
 		}
+		var directories []db.Directory
+		if dr, ok := repository.(directoryListRepository); ok {
+			directories, err = dr.DirectoriesUnderRoot(r.Context(), rootID)
+			if err != nil {
+				http.Error(w, "list directories", http.StatusInternalServerError)
+				return
+			}
+		}
 		response := fileListResponse{Path: path.Canonical, Files: make([]fileListEntry, 0)}
 		for _, file := range files {
 			if !strings.HasPrefix(file.ObjectKey, "objects/") || !isDirectChild(path.Canonical, file.LogicalPath) {
@@ -103,7 +118,25 @@ func listFiles(repository fileRepository, authorizer fileAuthorizer, policy conf
 			if err != nil || !allowed {
 				continue
 			}
-			response.Files = append(response.Files, fileListEntry{Name: strings.TrimPrefix(file.LogicalPath, path.Canonical+"/"), Path: file.LogicalPath, Size: file.Size, MD5Status: publicMD5Status(file.MD5Status), MD5Digest: publicMD5Digest(file.MD5Status, file.MD5Digest)})
+			prefix := path.Canonical + "/"
+			if path.Canonical == "/" {
+				prefix = "/"
+			}
+			response.Files = append(response.Files, fileListEntry{Name: strings.TrimPrefix(file.LogicalPath, prefix), Path: file.LogicalPath, Size: file.Size, ID: file.ID, UpdatedAt: file.UpdatedAt, MD5Status: publicMD5Status(file.MD5Status), MD5Digest: publicMD5Digest(file.MD5Status, file.MD5Digest)})
+		}
+		for _, d := range directories {
+			if !isDirectChild(path.Canonical, d.LogicalPath) {
+				continue
+			}
+			allowed, err := authorizer.Authorize(r.Context(), userID, rootID, d.LogicalPath, "read")
+			if err != nil || !allowed {
+				continue
+			}
+			prefix := path.Canonical + "/"
+			if path.Canonical == "/" {
+				prefix = "/"
+			}
+			response.Files = append(response.Files, fileListEntry{Name: strings.TrimPrefix(d.LogicalPath, prefix), Path: d.LogicalPath, IsDirectory: true, ID: d.ID, UpdatedAt: d.UpdatedAt})
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(response)
