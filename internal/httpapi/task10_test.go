@@ -37,6 +37,20 @@ func TestServerServesEmbeddedTransferUI(t *testing.T) {
 	}
 }
 
+func TestServerLoginPageIsSelfContainedAndPublic(t *testing.T) {
+	h, err := NewServer(config.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/login", "/login.html"} {
+		r := httptest.NewRecorder()
+		h.ServeHTTP(r, httptest.NewRequest(http.MethodGet, path, nil))
+		if r.Code != http.StatusOK || strings.Contains(r.Body.String(), `src="./app.js"`) {
+			t.Fatalf("login page is not a public self-contained page: status=%d body=%q", r.Code, r.Body.String())
+		}
+	}
+}
+
 func TestServerStaticUIOnlyAcceptsKnownAssets(t *testing.T) {
 	h, err := NewServer(config.Default())
 	if err != nil {

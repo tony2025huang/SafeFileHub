@@ -82,6 +82,7 @@ func NewProductionServer(cfg config.Config, users authenticator, sessions userSe
 	mux.HandleFunc("GET /healthz", healthz)
 	mux.HandleFunc("GET /readyz", readyz(checks))
 	mux.HandleFunc("GET /", transferUI)
+	mux.HandleFunc("GET /login", transferUI)
 	mux.HandleFunc("POST /login", login(users, sessions))
 	mux.HandleFunc("POST /logout", logout(sessions))
 	mux.Handle("GET /session", requireSession(sessions, http.HandlerFunc(sessionStatus)))

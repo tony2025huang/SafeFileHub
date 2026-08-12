@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-//go:embed assets/index.html assets/app.js
+//go:embed assets/index.html assets/app.js assets/login.html
 var staticAssets embed.FS
 
 // transferUI serves only the two compiled, embedded public assets. It does not
@@ -15,6 +15,9 @@ var staticAssets embed.FS
 func transferUI(w http.ResponseWriter, r *http.Request) {
 	asset := ""
 	switch path.Clean(r.URL.Path) {
+	case "/login", "/login.html":
+		asset = "assets/login.html"
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	case ".", "/", "/index.html":
 		asset = "assets/index.html"
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
