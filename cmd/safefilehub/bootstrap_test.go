@@ -9,6 +9,54 @@ import (
 	"testing"
 )
 
+func TestBootstrapRootPermissionsAreIdempotentAndPreserveDeny(t *testing.T) {
+	cfg := testConfig(t)
+	repo, err := db.Open(context.Background(), cfg.SQLitePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if _, err = bootstrapInitialAdmin(context.Background(), repo); err != nil {
+		t.Fatal(err)
+	}
+	if err = ensurePrimaryStorageRoot(context.Background(), repo, cfg.StorageRoot); err != nil {
+		t.Fatal(err)
+	}
+	u, err := repo.BootstrapAdmin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = repo.CreatePermission(context.Background(), db.Permission{UserID: u.ID, RootID: 1, PathPrefix: "/", Action: "delete", Allow: false}); err != nil {
+		t.Fatal(err)
+	}
+	if err = ensureBootstrapRootPermissions(context.Background(), repo, u.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = ensureBootstrapRootPermissions(context.Background(), repo, u.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	ps, err := repo.PermissionsForUserAndRoot(context.Background(), u.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := map[string]int{}
+	allows := map[string]bool{}
+	for _, p := range ps {
+		if p.PathPrefix == "/" {
+			counts[p.Action]++
+			allows[p.Action] = p.Allow
+		}
+	}
+	for _, action := range []string{"read", "write", "delete", "archive"} {
+		if counts[action] != 1 {
+			t.Fatalf("%s count=%d", action, counts[action])
+		}
+	}
+	if allows["delete"] {
+		t.Fatal("explicit delete deny was overwritten")
+	}
+}
+
 func TestBootstrapCreatesRandomLoginOnlyOnceAndStoresHash(t *testing.T) {
 	cfg := testConfig(t)
 	repo, e := db.Open(context.Background(), cfg.SQLitePath)

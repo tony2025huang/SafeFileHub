@@ -12,6 +12,7 @@ import {
   filesAPI,
   formatMD5,
   friendlyError,
+  mutationPath,
 } from './app.ts';
 
 test('friendly errors never expose internal server details', () => {
@@ -95,6 +96,12 @@ function fakeAPI({ failPaths = [], chunkSize = 2 } = {}) {
     async cancel(id) { calls.cancel.push(id); },
   };
 }
+
+test('mutation paths omit the root slash but preserve child paths', () => {
+  assert.equal(mutationPath('/'), '');
+  assert.equal(mutationPath('/name'), 'name');
+  assert.equal(mutationPath('/dir/name'), 'dir/name');
+});
 
 test('multiple files receive independent upload sessions', async () => {
   const api = fakeAPI();

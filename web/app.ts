@@ -7,6 +7,7 @@ export const DEFAULT_PER_FILE_CONCURRENCY = 4;
 export function friendlyError(error) {
   const status = Number(error?.status || 0);
   if (status === 401) { if (typeof location !== 'undefined') location.assign('/login'); return '登录已过期，请重新登录。'; }
+  if (status === 400) return '请求无法处理，请检查文件名或路径后重试。';
   if (status === 403) return '你没有执行此操作的权限。';
   if (status === 409) return '文件状态已变化，请刷新后重试。';
   if (status === 429) return '操作太频繁，请稍后再试。';
@@ -34,6 +35,13 @@ function joinPath(directory, relative) {
 
 export function encodeLogicalPath(path) {
   return path.split('/').map(segment => encodeURIComponent(segment)).join('/');
+}
+
+// File mutations use relative logical paths; the list endpoint alone reserves
+// '/' as its root-directory query value. Keep the canonical UI path separate
+// from this wire representation so paths are never double-decoded.
+export function mutationPath(path) {
+  return path === '/' ? '' : path.replace(/^\/+/, '').replace(/\/+$/, '');
 }
 
 export function createUploadBatch(files, api, options) {
@@ -165,7 +173,7 @@ export function uploadAPI(fetchImpl = fetch) {
   return {
     async create(input) {
       const response = await checked(await fetchImpl('/api/uploads', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...input, path: encodeLogicalPath(input.path) }), credentials: 'same-origin',
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...input, path: encodeLogicalPath(mutationPath(input.path)) }), credentials: 'same-origin',
       }));
       const value = await response.json();
       return { uploadID: value.upload_id, chunkSize: value.chunk_size, offset: value.offset };
@@ -193,8 +201,8 @@ export function filesAPI(fetchImpl = fetch) {
       if (!Number.isInteger(rootID) || rootID <= 0) throw new Error('a positive rootID is required');
       return checked(await fetchImpl(`/roots/${rootID}/files?path=${encodeLogicalPath(path)}`, { credentials: 'same-origin' })).then(response => response.json());
     },
-    async createDirectory(rootID, path) { await checked(await fetchImpl('/api/directories', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({root_id: rootID, path: encodeLogicalPath(path)}), credentials:'same-origin' })); },
-    async createFile(rootID, path) { await checked(await fetchImpl('/api/files', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({root_id: rootID, path: encodeLogicalPath(path)}), credentials:'same-origin' })); },
+    async createDirectory(rootID, path) { await checked(await fetchImpl('/api/directories', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({root_id: rootID, path: encodeLogicalPath(mutationPath(path))}), credentials:'same-origin' })); },
+    async createFile(rootID, path) { await checked(await fetchImpl('/api/files', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({root_id: rootID, path: encodeLogicalPath(mutationPath(path))}), credentials:'same-origin' })); },
     async deleteFile(fileID) { await checked(await fetchImpl(`/api/files/${encodeURIComponent(fileID)}`, { method: 'DELETE', credentials: 'same-origin' })); },
     async deleteDirectory(directoryID) { await checked(await fetchImpl(`/api/directories/${encodeURIComponent(directoryID)}`, { method: 'DELETE', credentials: 'same-origin' })); },
     async archive(rootID, path) {
@@ -382,7 +390,7 @@ function mountUI() {
   if (fileSearch) fileSearch.addEventListener('input', () => { const query = fileSearch.value.trim().toLowerCase(); const filtered = listedFiles.filter(file => !query || `${file.name} ${file.path}`.toLowerCase().includes(query)); fileList?.replaceChildren(...filtered.map(file => { const row=document.createElement('li'); row.className='file-row'; row.textContent=`${file.is_directory ? '📁' : '📄'} ${file.name || file.path} · ${file.is_directory ? '文件夹' : `${file.size ?? 0} bytes`}`; return row; })); filesStatus.textContent = filtered.length ? `${filtered.length} 项` : (query ? '没有匹配的文件。' : '当前目录为空。'); });
   if (fileActions) fileActions.addEventListener('click', async event => { const button = event.target.closest('button[data-action]'); if (!button || !['mkdir', 'text', 'archive'].includes(button.dataset.action)) return; if (button.dataset.action === 'archive') { try { const job=await fileAPI.archive(Number(root.value), directory.value || '/'); filesStatus.textContent=`归档任务已创建：${job.id || '处理中'}`; } catch(error) { filesStatus.textContent=friendlyError(error); } return; }
     const name = prompt(button.dataset.action === 'mkdir' ? '新建目录名称' : '新建文本名称（仅创建空文件）'); if (!name?.trim()) return;
-    const path = `${(directory.value || '/').replace(/\/$/, '')}/${name.trim()}`;
+    const path = joinPath(directory.value || '/', name.trim());
     try { if (button.dataset.action === 'text') { const content = prompt('文本内容（后端当前仅支持创建空文件，内容不会保存）', ''); await fileAPI.createFile(Number(root.value), path); filesStatus.textContent = content ? '文本文件已创建，但后端不支持保存内容，内容未写入。' : '空文本文件已创建。'; } else { await fileAPI.createDirectory(Number(root.value), path); filesStatus.textContent = '目录已创建。'; } await renderFiles(); } catch (error) { filesStatus.textContent = friendlyError(error); }
   });
   const admin = document.querySelector('#admin-settings');

@@ -168,6 +168,13 @@ func runWithLifecycle(lifecycle context.Context, args []string, cfg config.Confi
 	if err := ensurePrimaryStorageRoot(lifecycle, repo, cfg.StorageRoot); err != nil {
 		return err
 	}
+	bootstrap, err := repo.BootstrapAdmin(lifecycle)
+	if err != nil {
+		return fmt.Errorf("load bootstrap administrator: %w", err)
+	}
+	if err := ensureBootstrapRootPermissions(lifecycle, repo, bootstrap.ID, 1); err != nil {
+		return err
+	}
 
 	sessions := auth.NewSessionManager(auth.NewMemorySessionStore(), auth.SessionConfig{LifecycleContext: lifecycle})
 	defer sessions.Close()
@@ -255,6 +262,28 @@ func runWithLifecycle(lifecycle context.Context, args []string, cfg config.Confi
 
 // ensurePrimaryStorageRoot keeps the single product root internal to startup.
 // The browser never needs to discover or edit this technical identifier.
+func ensureBootstrapRootPermissions(ctx context.Context, repo *db.Repository, userID, rootID int64) error {
+	permissions, err := repo.PermissionsForUserAndRoot(ctx, userID, rootID)
+	if err != nil {
+		return fmt.Errorf("load bootstrap permissions: %w", err)
+	}
+	existing := make(map[string]bool, len(permissions))
+	for _, p := range permissions {
+		// A row already occupies this unique key, whether it is an allow or
+		// an explicit deny. Never overwrite policy set by an administrator.
+		existing[p.PathPrefix+"\x00"+p.Action] = true
+	}
+	for _, action := range []string{"read", "write", "delete", "archive"} {
+		if existing["/\x00"+action] {
+			continue
+		}
+		if _, err := repo.CreatePermission(ctx, db.Permission{UserID: userID, RootID: rootID, PathPrefix: "/", Action: action, Allow: true}); err != nil {
+			return fmt.Errorf("create bootstrap %s permission: %w", action, err)
+		}
+	}
+	return nil
+}
+
 func ensurePrimaryStorageRoot(ctx context.Context, repo *db.Repository, path string) error {
 	if _, err := repo.StorageRootByID(ctx, 1); err == nil {
 		return nil
