@@ -28,6 +28,22 @@ test('UI renders safe failure states instead of raw exception messages', async (
   assert.match(source, /服务暂时不可用，请稍后再试/);
 });
 
+test('upload controls keep file and directory pickers separate and bind the right buttons', async () => {
+  const [html, source] = await Promise.all([
+    readFile(new URL('./index.html', import.meta.url), 'utf8'),
+    readFile(new URL('./app.ts', import.meta.url), 'utf8'),
+  ]);
+  assert.match(html, /id="files" type="file" multiple(?![^>]*webkitdirectory)/);
+  assert.match(html, /id="directories" type="file" multiple webkitdirectory/);
+  assert.doesNotMatch(html, /onclick=/);
+  assert.match(html, /data-action="upload-file"/);
+  assert.match(html, /data-action="upload-dir"/);
+  assert.match(source, /const uploadFile = document\.querySelector\('\[data-action="upload-file"\]'\)/);
+  assert.match(source, /selectedInput = input; input\.click\(\)/);
+  assert.match(source, /const uploadDir = document\.querySelector\('\[data-action="upload-dir"\]'\)/);
+  assert.match(source, /selectedInput = directories; directories\.click\(\)/);
+});
+
 test('deployment HTML loads the browser-ready JavaScript entrypoint', async () => {
   const [html, browserEntry, source] = await Promise.all([
     readFile(new URL('./index.html', import.meta.url), 'utf8'),

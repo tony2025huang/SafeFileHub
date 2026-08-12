@@ -285,6 +285,7 @@ function setAdminForm(settings, form) {
 function mountUI() {
   const form = document.querySelector('#upload-form');
   const input = document.querySelector('#files');
+  const directories = document.querySelector('#directories');
   const directory = document.querySelector('#directory');
   const root = document.querySelector('#root-id');
   const list = document.querySelector('#uploads');
@@ -295,7 +296,8 @@ function mountUI() {
   const fileSearch = document.querySelector('#file-search');
   const breadcrumb = document.querySelector('#breadcrumb');
   const fileActions = document.querySelector('#file-actions');
-  if (!form || !input || !directory || !root || !list || !result) return;
+  if (!form || !input || !directories || !directory || !root || !list || !result) return;
+  let selectedInput = input;
   const settingsView = document.querySelector('[data-view="settings"]');
   const filesView = document.querySelector('[data-view="files"]');
   const settingsLink = document.querySelector('[data-view-link="settings"]');
@@ -307,7 +309,7 @@ function mountUI() {
   navigate(location.hash === '#settings' ? 'settings' : 'files');
   form.addEventListener('submit', async event => {
     event.preventDefault();
-    const batch = createUploadBatch(input.files, uploadAPI(), { rootID: Number(root.value), directory: directory.value || '/' });
+    const batch = createUploadBatch(selectedInput.files, uploadAPI(), { rootID: Number(root.value), directory: directory.value || '/' });
     const render = () => { list.replaceChildren(...batch.items.map(item => {
       const row = document.createElement('li');
       row.className = 'upload-row';
@@ -360,6 +362,10 @@ function mountUI() {
     } catch (error) { fileList.replaceChildren(); filesStatus.textContent = friendlyError(error); }
   };
   if (refreshFiles) refreshFiles.addEventListener('click', () => { void renderFiles(); });
+  const uploadFile = document.querySelector('[data-action="upload-file"]');
+  const uploadDir = document.querySelector('[data-action="upload-dir"]');
+  if (uploadFile) uploadFile.addEventListener('click', () => { selectedInput = input; input.click(); });
+  if (uploadDir) uploadDir.addEventListener('click', () => { selectedInput = directories; directories.click(); });
   if (fileSearch) fileSearch.addEventListener('input', () => { const query = fileSearch.value.trim().toLowerCase(); const filtered = listedFiles.filter(file => !query || `${file.name} ${file.path}`.toLowerCase().includes(query)); fileList?.replaceChildren(...filtered.map(file => { const row=document.createElement('li'); row.className='file-row'; row.textContent=`${file.is_directory ? '📁' : '📄'} ${file.name || file.path} · ${file.is_directory ? '文件夹' : `${file.size ?? 0} bytes`}`; return row; })); filesStatus.textContent = filtered.length ? `${filtered.length} 项` : (query ? '没有匹配的文件。' : '当前目录为空。'); });
   if (fileActions) fileActions.addEventListener('click', async event => { const button = event.target.closest('button[data-action]'); if (!button || !['mkdir', 'text', 'archive'].includes(button.dataset.action)) return; if (button.dataset.action === 'text') { filesStatus.textContent='后端未提供文本文件读取/写入契约，出于安全考虑暂不支持在线编辑。'; return; } const name = prompt(button.dataset.action === 'mkdir' ? '新建目录名称' : ''); if (button.dataset.action === 'archive') { try { const job=await fileAPI.archive(Number(root.value), directory.value || '/'); filesStatus.textContent=`归档任务已创建：${job.id || '处理中'}`; } catch(error) { filesStatus.textContent=friendlyError(error); } return; } if (!name) return; try { const path = `${(directory.value || '/').replace(/\/$/, '')}/${name}`; await fileAPI.createDirectory(Number(root.value), path); filesStatus.textContent = '操作成功。'; await renderFiles(); } catch (error) { filesStatus.textContent = friendlyError(error); } });
   const admin = document.querySelector('#admin-settings');
