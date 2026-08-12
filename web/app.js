@@ -300,6 +300,9 @@ function mountUI() {
   const fileActions = document.querySelector('#file-actions');
   if (!form || !input || !directories || !list || !result) return;
   let selectedInput = input;
+  let queuedFiles = [];
+  let queuedBatch = null;
+  let uploadStarted = false;
   const settingsView = document.querySelector('[data-view="settings"]');
   const filesView = document.querySelector('[data-view="files"]');
   const settingsLink = document.querySelector('[data-view-link="settings"]');
@@ -309,28 +312,34 @@ function mountUI() {
     event.preventDefault(); navigate(link.dataset.viewLink);
   });
   navigate(location.hash === '#settings' ? 'settings' : 'files');
+  const renderQueue = batch => { list.replaceChildren(...(batch?.items || []).map(item => {
+    const row = document.createElement('li'); row.className = 'upload-row';
+    const info = document.createElement('div'); info.className = 'upload-info';
+    const title = document.createElement('strong'); title.textContent = item.path;
+    const details = document.createElement('span'); details.className = 'status'; details.textContent = `${item.file.name} · ${formatFileSize(item.file.size)} · 目标：${item.path}`;
+    const progress = document.createElement('progress'); progress.className = 'progress'; progress.max = 1; progress.value = item.progress;
+    const state = document.createElement('span'); state.className = 'badge'; state.textContent = ({ queued: '待上传', uploading: '上传中', paused: '已暂停', completed: '已完成', failed: '失败', cancelled: '已取消' })[item.status] || item.status;
+    info.append(title, details, progress, state); if (item.error) { const error = document.createElement('span'); error.className = 'error'; error.textContent = item.error; info.append(error); }
+    row.append(info);
+    if (!uploadStarted && item.status === 'queued') { const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'danger'; remove.textContent = '移除'; remove.onclick = () => { const index = queuedBatch.items.indexOf(item); if (index >= 0) queuedBatch.items.splice(index, 1); queuedFiles.splice(index, 1); renderQueue(queuedBatch); result.textContent = `${queuedBatch.items.length} 项待上传`; }; row.append(remove); }
+    for (const [label, action] of [['暂停', () => queuedBatch.pause(item)], ['取消', () => queuedBatch.cancel(item)], ['重试', () => queuedBatch.retry(item)]]) { if (item.status === 'queued' && !uploadStarted && label !== '取消') continue; const button = document.createElement('button'); button.type = 'button'; button.textContent = label; button.onclick = async () => { await action(); renderQueue(queuedBatch); }; row.append(' ', button); }
+    return row;
+  })); };
+  const addSelectedFiles = files => {
+    if (uploadStarted) return;
+    const seen = new Set(queuedFiles.map(file => `${file.webkitRelativePath || file.name}\u0000${file.size}\u0000${file.lastModified || 0}`));
+    for (const file of files) { const key = `${file.webkitRelativePath || file.name}\u0000${file.size}\u0000${file.lastModified || 0}`; if (!seen.has(key)) { queuedFiles.push(file); seen.add(key); } }
+    queuedBatch = createUploadBatch(queuedFiles, uploadAPI(), { rootID: Number(root.value), directory: directory.value || '/', onProgress: () => renderQueue(queuedBatch) });
+    renderQueue(queuedBatch); result.textContent = `${queuedBatch.items.length} 项待上传`; input.value = ''; directories.value = '';
+  };
+  input.addEventListener('change', () => addSelectedFiles(input.files));
+  directories.addEventListener('change', () => addSelectedFiles(directories.files));
   form.addEventListener('submit', async event => {
     event.preventDefault();
-    const batch = createUploadBatch(selectedInput.files, uploadAPI(), { rootID: Number(root.value), directory: directory.value || '/' });
-    const render = () => { list.replaceChildren(...batch.items.map(item => {
-      const row = document.createElement('li');
-      row.className = 'upload-row';
-      const info = document.createElement('div'); info.className = 'upload-info';
-      const title = document.createElement('strong'); title.textContent = item.path;
-      const progress = document.createElement('progress'); progress.className = 'progress'; progress.max = 1; progress.value = item.progress;
-      const state = document.createElement('span'); state.className = 'badge'; state.textContent = ({ queued: '排队中', uploading: '上传中', paused: '已暂停', completed: '已完成', failed: '失败', cancelled: '已取消' })[item.status] || item.status;
-      info.append(title, progress, state);
-      if (item.error) { const error = document.createElement('span'); error.className = 'error'; error.textContent = item.error; info.append(error); }
-      row.append(info);
-      for (const [label, action] of [['暂停', () => batch.pause(item)], ['取消', () => batch.cancel(item)], ['重试', () => batch.retry(item)]]) {
-        const button = document.createElement('button'); button.type = 'button'; button.textContent = label;
-        button.onclick = async () => { await action(); render(); }; row.append(' ', button);
-      }
-      return row;
-    })); };
-    render();
-    const summary = await batch.start();
-    render();
+    if (!queuedBatch || !queuedBatch.items.length) { result.textContent = '请先选择要上传的文件或目录。'; return; }
+    if (uploadStarted) return;
+    uploadStarted = true; renderQueue(queuedBatch);
+    const summary = await queuedBatch.start(); renderQueue(queuedBatch);
     result.textContent = `${summary.completed}/${summary.total} completed; ${summary.failed} failed; ${summary.cancelled} cancelled`;
     void renderFiles();
   });
@@ -371,7 +380,11 @@ function mountUI() {
   if (uploadFile) uploadFile.addEventListener('click', () => { selectedInput = input; input.click(); });
   if (uploadDir) uploadDir.addEventListener('click', () => { selectedInput = directories; directories.click(); });
   if (fileSearch) fileSearch.addEventListener('input', () => { const query = fileSearch.value.trim().toLowerCase(); const filtered = listedFiles.filter(file => !query || `${file.name} ${file.path}`.toLowerCase().includes(query)); fileList?.replaceChildren(...filtered.map(file => { const row=document.createElement('li'); row.className='file-row'; row.textContent=`${file.is_directory ? '📁' : '📄'} ${file.name || file.path} · ${file.is_directory ? '文件夹' : `${file.size ?? 0} bytes`}`; return row; })); filesStatus.textContent = filtered.length ? `${filtered.length} 项` : (query ? '没有匹配的文件。' : '当前目录为空。'); });
-  if (fileActions) fileActions.addEventListener('click', async event => { const button = event.target.closest('button[data-action]'); if (!button || !['mkdir', 'text', 'archive'].includes(button.dataset.action)) return; if (button.dataset.action === 'text') { filesStatus.textContent='后端未提供文本文件读取/写入契约，出于安全考虑暂不支持在线编辑。'; return; } const name = prompt(button.dataset.action === 'mkdir' ? '新建目录名称' : ''); if (button.dataset.action === 'archive') { try { const job=await fileAPI.archive(Number(root.value), directory.value || '/'); filesStatus.textContent=`归档任务已创建：${job.id || '处理中'}`; } catch(error) { filesStatus.textContent=friendlyError(error); } return; } if (!name) return; try { const path = `${(directory.value || '/').replace(/\/$/, '')}/${name}`; await fileAPI.createDirectory(Number(root.value), path); filesStatus.textContent = '操作成功。'; await renderFiles(); } catch (error) { filesStatus.textContent = friendlyError(error); } });
+  if (fileActions) fileActions.addEventListener('click', async event => { const button = event.target.closest('button[data-action]'); if (!button || !['mkdir', 'text', 'archive'].includes(button.dataset.action)) return; if (button.dataset.action === 'archive') { try { const job=await fileAPI.archive(Number(root.value), directory.value || '/'); filesStatus.textContent=`归档任务已创建：${job.id || '处理中'}`; } catch(error) { filesStatus.textContent=friendlyError(error); } return; }
+    const name = prompt(button.dataset.action === 'mkdir' ? '新建目录名称' : '新建文本名称（仅创建空文件）'); if (!name?.trim()) return;
+    const path = `${(directory.value || '/').replace(/\/$/, '')}/${name.trim()}`;
+    try { if (button.dataset.action === 'text') { const content = prompt('文本内容（后端当前仅支持创建空文件，内容不会保存）', ''); await fileAPI.createFile(Number(root.value), path); filesStatus.textContent = content ? '文本文件已创建，但后端不支持保存内容，内容未写入。' : '空文本文件已创建。'; } else { await fileAPI.createDirectory(Number(root.value), path); filesStatus.textContent = '目录已创建。'; } await renderFiles(); } catch (error) { filesStatus.textContent = friendlyError(error); }
+  });
   const admin = document.querySelector('#admin-settings');
   const adminForm = document.querySelector('#admin-settings-form');
   const adminStatus = document.querySelector('#admin-settings-status');
